@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TASK_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
+PYTHONPATH="${TASK_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    exec python3 "${TASK_ROOT}/src/flux_account_update_db.py" "$@"

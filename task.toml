@@ -1,0 +1,53 @@
+schema_version = "1.1"
+
+[task]
+name = "talents/flux-accounting-safe-migration"
+description = "Repair historical fair-share migration, idempotent retry, schema fidelity, and failure recovery in an offline Flux accounting SQLite upgrader."
+authors = []
+keywords = ["python", "hpc", "flux", "sqlite", "migration", "recovery"]
+
+[metadata]
+difficulty = "hard"
+category = "systems"
+tags = ["debugging", "database", "hpc", "transactions", "offline"]
+expert_time_estimate_min = 150.0
+junior_time_estimate_min = 360.0
+difficulty_explanation = """
+The starter returns success while discarding fair-share history. A complete
+repair must reason across SQLite schema introspection, ordered composite keys,
+legacy-to-normalized data transformation, partial retries, backup consistency,
+transaction rollback, and downstream usage updates. Local changes that only
+move one function call or add a backup copy leave idempotency, schema fidelity,
+or failure restoration wrong. The verifier uses independent randomized legacy
+schemas and byte-level failure-safety observations.
+"""
+
+[verifier]
+timeout_sec = 300.0
+user = "root"
+
+[agent]
+timeout_sec = 7200.0
+user = "candidate"
+
+[environment]
+build_timeout_sec = 300.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+allow_internet = false
+mcp_servers = []
+workdir = "/workspace/flux-accounting"
+
+[environment.env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"
+
+[verifier.env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"
+
+[solution.env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"

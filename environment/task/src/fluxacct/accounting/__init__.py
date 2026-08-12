@@ -1,0 +1,113 @@
+DB_DIR = "@X_LOCALSTATEDIR@/lib/flux/"
+DB_PATH = "@X_LOCALSTATEDIR@/lib/flux/FluxAccounting.db"
+DB_SCHEMA_VERSION = 37
+
+PRIORITY_FACTORS = ["fairshare", "queue", "bank", "urgency"]
+FSHARE_WEIGHT_DEFAULT = 100000
+QUEUE_WEIGHT_DEFAULT = 10000
+BANK_WEIGHT_DEFAULT = 0
+URGENCY_WEIGHT_DEFAULT = 1000
+INTEGER_MAX = 2147483647
+
+# flux-accounting DB table column names
+ASSOCIATION_TABLE = [
+    "creation_time",
+    "mod_time",
+    "active",
+    "username",
+    "userid",
+    "bank",
+    "default_bank",
+    "shares",
+    "job_usage",
+    "fairshare",
+    "max_running_jobs",
+    "max_active_jobs",
+    "max_nodes",
+    "max_cores",
+    "queues",
+    "projects",
+    "default_project",
+    "max_sched_jobs",
+]
+BANK_TABLE = [
+    "bank_id",
+    "bank",
+    "active",
+    "parent_bank",
+    "shares",
+    "job_usage",
+    "priority",
+    "ignore_older_than",
+]
+QUEUE_TABLE = [
+    "queue",
+    "min_nodes_per_job",
+    "max_nodes_per_job",
+    "max_time_per_job",
+    "priority",
+    "max_running_jobs",
+    "max_nodes_per_assoc",
+    "max_sched_jobs",
+    "max_sched_nodes_per_assoc",
+    "max_sched_cores_per_assoc",
+]
+PROJECT_TABLE = ["project_id", "project", "usage"]
+JOBS_TABLE = [
+    "id",
+    "userid",
+    "t_submit",
+    "t_run",
+    "t_inactive",
+    "ranks",
+    "R",
+    "jobspec",
+    "project",
+    "bank",
+    "requested_duration",
+    "actual_duration",
+]
+PRIORITY_FACTOR_WEIGHTS_TABLE = ["factor", "weight"]
+CONFIG_TABLE = ["key", "value"]
+JOB_USAGE_PER_ASSOC_TABLE = [
+    "username",
+    "userid",
+    "bank",
+    "period",
+    "value",
+]
+JOB_RECORD_FIELDS = [
+    "jobid",
+    "username",
+    "userid",
+    "t_submit",
+    "t_run",
+    "t_inactive",
+    "nnodes",
+    "project",
+    "bank",
+    "requested_duration",
+    "actual_duration",
+    "duration_delta",
+]
+JOB_RECORD_FLOAT_FIELDS = {
+    "t_submit",
+    "t_run",
+    "t_inactive",
+    "requested_duration",
+    "actual_duration",
+    "duration_delta",
+}
+
+__all__ = [
+    "DB_DIR",
+    "DB_PATH",
+    "DB_SCHEMA_VERSION",
+    "ASSOCIATION_TABLE",
+    "BANK_TABLE",
+    "QUEUE_TABLE",
+    "PROJECT_TABLE",
+    "JOBS_TABLE",
+    "PRIORITY_FACTOR_WEIGHTS_TABLE",
+    "CONFIG_TABLE",
+]

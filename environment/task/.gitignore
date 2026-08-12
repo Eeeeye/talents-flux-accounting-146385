@@ -1,0 +1,5 @@
+.incident-work/
+__pycache__/
+*.pyc
+*.db
+*.db.backup
