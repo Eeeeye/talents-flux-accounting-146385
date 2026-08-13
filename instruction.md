@@ -102,8 +102,9 @@ must not create duplicate period rows.
 
 - Keep the two public executables under `bin/` and their existing flags.
 - Keep the database schema version at 37.
-- Use only Python's standard library and SQLite; the grading environment is
-  offline and installing packages is not permitted.
+- Use only Python's standard library and SQLite. The task is self-contained;
+  installing packages or making the repair depend on network access is not
+  permitted.
 - Do not weaken SQLite constraints, disable foreign-key handling, replace the
   migration with a database-specific hard-coded dump, or special-case the
   supplied fixture values.
