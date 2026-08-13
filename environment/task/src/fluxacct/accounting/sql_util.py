@@ -11,7 +11,7 @@
 ###############################################################
 def validate_columns(columns, valid_columns):
     """
-    Validate a list of of columns against a list of valid columns of a table
+    Validate a list of columns against a list of valid columns of a table
     in a flux-accounting database.
 
     Args:
