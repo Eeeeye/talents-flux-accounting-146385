@@ -1,13 +1,13 @@
 schema_version = "1.1"
 
 [task]
-name = "talents/flux-accounting-safe-migration"
+name = "talents/flux-safe-migration"
 description = "Repair historical fair-share migration, idempotent retry, schema fidelity, and failure recovery in an offline Flux accounting SQLite upgrader."
 authors = []
 keywords = ["python", "hpc", "flux", "sqlite", "migration", "recovery"]
 
 [metadata]
-difficulty = "hard"
+difficulty = "expert"
 category = "systems"
 tags = ["debugging", "database", "hpc", "transactions", "offline"]
 expert_time_estimate_min = 150.0

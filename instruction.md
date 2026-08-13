@@ -39,6 +39,11 @@ of the following requirements.
 - For tables present in both databases, the final column set and primary key
   must match the target schema. Values in columns shared by both schemas must
   be preserved.
+- A target-only column receives the behavior declared by the target table: an
+  omitted column uses its declared DEFAULT or NULL where SQLite permits it. If
+  existing rows cannot satisfy a target-only column (for example, it is NOT
+  NULL and has no DEFAULT), the migration must fail and follow the post-backup
+  recovery requirements below; inventing a value is not permitted.
 - Existing rows and tables unrelated to a schema change must remain intact.
 - A successful migration sets `PRAGMA user_version` to `37`, and
   `PRAGMA integrity_check` must return `ok`.
@@ -99,9 +104,11 @@ schema upgrade without inventing usage values.
   `.backup` available.
 - A failed migration must not advance `PRAGMA user_version` or leave temporary
   tables in the restored database.
-- Missing source or target databases, and either input path being a directory or
-  symbolic link rather than a regular file, must be rejected with a non-zero
-  exit code before a migration begins.
+- Missing source databases and, when `-n` is supplied, missing target databases
+  must be rejected before migration. Both explicit input paths must name
+  existing regular files; directories and symbolic links are rejected. The
+  internally generated target used when `-n` is omitted is not an external
+  input and is exempt from this preflight check.
 - When `-n` is omitted, the command must generate the bundled schema-version-37
   target through the existing `fluxacct.accounting.create_db` interface.
   When `-n` is supplied, `TARGET.db` must be a different physical file from
@@ -113,6 +120,13 @@ duration of the command. Concurrent readers/writers, forced termination,
 kernel failure, and power loss are outside the required failure model. The
 failure guarantees above apply to ordinary process errors and exceptions that
 the command can catch.
+
+Byte equality means equality of every byte in the SQLite main database file;
+file ownership, mode bits, and timestamps are not compared. After a fresh
+backup is published, recovery must prepare a replacement in the source
+directory and atomically replace the main database after removing transient
+WAL/SHM/journal sidecars. Atomicity against forced termination, kernel failure,
+or power loss remains outside the required model above.
 
 ### Downstream compatibility
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ast
+import base64
 import ctypes
 import errno
 import hashlib
@@ -11,6 +12,7 @@ from pathlib import Path
 import platform
 import random
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -49,6 +51,100 @@ EXPECTED_HELP_FRAGMENTS = (
     "-n, --new-db NEW_DB",
     "target schema",
 )
+
+DEFAULT_TARGET_SCHEMA = """
+PRAGMA user_version=37;
+CREATE TABLE association_table (
+    creation_time bigint(20) NOT NULL,
+    mod_time bigint(20) DEFAULT 0 NOT NULL,
+    active int(11) DEFAULT 1 NOT NULL,
+    username tinytext NOT NULL,
+    userid int(11) DEFAULT 65534 NOT NULL,
+    bank tinytext NOT NULL,
+    default_bank tinytext NOT NULL,
+    shares int(11) DEFAULT 1 NOT NULL ON CONFLICT REPLACE DEFAULT 1,
+    job_usage real DEFAULT 0.0 NOT NULL,
+    fairshare real DEFAULT 0.5 NOT NULL ON CONFLICT REPLACE DEFAULT 0.5,
+    max_running_jobs int(11) DEFAULT 5 NOT NULL ON CONFLICT REPLACE DEFAULT 5,
+    max_active_jobs int(11) DEFAULT 7 NOT NULL ON CONFLICT REPLACE DEFAULT 7,
+    max_nodes int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    max_cores int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    queues tinytext DEFAULT '' NOT NULL ON CONFLICT REPLACE DEFAULT '',
+    projects tinytext DEFAULT '*' NOT NULL ON CONFLICT REPLACE DEFAULT '*',
+    default_project tinytext DEFAULT '*' NOT NULL ON CONFLICT REPLACE DEFAULT '*',
+    max_sched_jobs int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    PRIMARY KEY (username, bank)
+);
+CREATE TABLE bank_table (
+    bank_id integer PRIMARY KEY AUTOINCREMENT,
+    bank text NOT NULL,
+    active int(11) DEFAULT 1 NOT NULL,
+    parent_bank text DEFAULT '',
+    shares int NOT NULL,
+    job_usage real DEFAULT 0.0 NOT NULL,
+    priority real DEFAULT 0.0 NOT NULL ON CONFLICT REPLACE DEFAULT 0.0,
+    ignore_older_than bigint(20) DEFAULT 0
+);
+CREATE TABLE job_usage_factor_table (
+    username tinytext NOT NULL,
+    userid int(11) NOT NULL,
+    bank tinytext NOT NULL,
+    last_job_timestamp real DEFAULT 0.0,
+    PRIMARY KEY (username, bank)
+);
+CREATE TABLE t_half_life_period_table (
+    cluster tinytext DEFAULT 'cluster',
+    end_half_life_period real DEFAULT 0.0
+);
+CREATE TABLE queue_table (
+    queue tinytext NOT NULL,
+    min_nodes_per_job int(11) DEFAULT 1 NOT NULL ON CONFLICT REPLACE DEFAULT 1,
+    max_nodes_per_job int(11) DEFAULT 1 NOT NULL ON CONFLICT REPLACE DEFAULT 1,
+    max_time_per_job int(11) DEFAULT 60 NOT NULL ON CONFLICT REPLACE DEFAULT 60,
+    priority int(11) DEFAULT 0 NOT NULL ON CONFLICT REPLACE DEFAULT 0,
+    max_running_jobs int(11) DEFAULT 100 NOT NULL ON CONFLICT REPLACE DEFAULT 100,
+    max_nodes_per_assoc int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    max_sched_jobs int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    max_sched_nodes_per_assoc int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    max_sched_cores_per_assoc int(11) DEFAULT 2147483647 NOT NULL ON CONFLICT REPLACE DEFAULT 2147483647,
+    PRIMARY KEY (queue)
+);
+CREATE TABLE project_table (
+    project_id integer PRIMARY KEY AUTOINCREMENT,
+    project tinytext NOT NULL,
+    usage real DEFAULT 0.0 NOT NULL
+);
+CREATE TABLE jobs (
+    id char(16) PRIMARY KEY NOT NULL,
+    userid integer NOT NULL,
+    t_submit real NOT NULL,
+    t_run real NOT NULL,
+    t_inactive real NOT NULL,
+    ranks text NOT NULL,
+    R text NOT NULL,
+    jobspec text NOT NULL,
+    project text,
+    bank text,
+    requested_duration real DEFAULT 0.0,
+    actual_duration real DEFAULT 0.0
+);
+CREATE TABLE priority_factor_weight_table (
+    factor text PRIMARY KEY NOT NULL,
+    weight integer NOT NULL
+);
+CREATE TABLE config_table (
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
+CREATE TABLE job_usage_per_association_table (
+    username tinytext NOT NULL,
+    userid int(11) NOT NULL,
+    bank tinytext NOT NULL,
+    period int(11) NOT NULL,
+    value real DEFAULT 0.0,
+    PRIMARY KEY (username, bank, period)
+);
+"""
 
 
 def terminate_candidate_processes():
@@ -337,6 +433,37 @@ def assert_standard_library_only(workspace):
         )
 
 
+def assert_no_verifier_fixture_fingerprints(workspace):
+    known_fragments = (
+        "4815162342",
+        "period-boundary",
+        "default-user",
+        "scheduler-owner",
+        "site-extension-must-survive",
+        "missing-parent",
+        "preserve-shared-columns",
+        "stale-backup-from-an-earlier-run",
+    )
+    encodings = []
+    for fragment in known_fragments:
+        encodings.extend(
+            (
+                fragment,
+                base64.b64encode(fragment.encode()).decode(),
+                fragment.encode().hex(),
+            )
+        )
+    for path in candidate_source_files(workspace):
+        try:
+            text = path.read_text(encoding="utf-8").lower()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for encoded in encodings:
+            assert encoded.lower() not in text, (
+                f"verifier fixture fingerprint embedded in candidate source: {path}"
+            )
+
+
 def assert_network_syscalls_blocked():
     probe = (
         "import errno, socket, sys\n"
@@ -609,12 +736,23 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
 
 def usage_rows(conn):
     return {
-        (row[0], row[1], row[2], row[3]): row[4]
+        (row[0], row[1], row[2], row[3]): (row[4], row[5])
         for row in conn.execute(
-            "SELECT username, userid, bank, period, value "
+            "SELECT username, userid, bank, period, value, typeof(value) "
             "FROM job_usage_per_association_table"
         )
     }
+
+
+def expected_sqlite_numeric(value):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE numeric_probe (value REAL)")
+    conn.execute("INSERT INTO numeric_probe VALUES (?)", (value,))
+    observed = conn.execute(
+        "SELECT value, typeof(value) FROM numeric_probe"
+    ).fetchone()
+    conn.close()
+    return observed
 
 
 def assert_database_matches_target(path, target, expected, preserved=None):
@@ -651,7 +789,7 @@ def assert_database_matches_target(path, target, expected, preserved=None):
     observed = usage_rows(conn)
     assert observed.keys() == expected.keys(), (observed, expected)
     for key, value in expected.items():
-        assert math.isclose(observed[key], value, rel_tol=0, abs_tol=1e-12), key
+        assert observed[key] == expected_sqlite_numeric(value), key
     assert conn.execute("SELECT priority FROM queue_table WHERE queue='batch'").fetchone()[0] == 3
     if preserved is not None:
         assert_preserved_rows(conn, preserved)
@@ -666,9 +804,55 @@ def assert_database_matches_target(path, target, expected, preserved=None):
     target_conn.close()
 
 
-def assert_target_constraints_enforced(path):
+def assert_schema_matches_target(path, target):
+    conn = sqlite3.connect(path)
+    target_conn = sqlite3.connect(target)
+    expected_tables = user_tables(target_conn)
+    observed_tables = user_tables(conn)
+    assert expected_tables <= observed_tables, expected_tables - observed_tables
+    for table in sorted(expected_tables):
+        assert [row[1:6] for row in table_info(conn, table)] == [
+            row[1:6] for row in table_info(target_conn, table)
+        ], table
+        assert primary_key(conn, table) == primary_key(target_conn, table), table
+        assert normalized_table_sql(conn, table) == normalized_table_sql(
+            target_conn, table
+        ), table
+        assert conn.execute(f"PRAGMA foreign_key_list({quote(table)})").fetchall() == (
+            target_conn.execute(
+                f"PRAGMA foreign_key_list({quote(table)})"
+            ).fetchall()
+        ), table
+        assert explicit_indexes(conn, table) == explicit_indexes(
+            target_conn, table
+        ), table
+    conn.close()
+    target_conn.close()
+
+
+def assert_default_schema_constraints_enforced(path):
+    conn = sqlite3.connect(path)
+    invalid = (
+        "INSERT INTO association_table "
+        "(creation_time, username, userid, bank, default_bank, shares) "
+        "VALUES (0, 'duplicate', 1, 'bank', 'bank', 1)",
+        "INSERT INTO queue_table (queue) VALUES ('duplicate')",
+    )
+    for statement in invalid:
+        conn.execute(statement)
+        try:
+            conn.execute(statement)
+        except sqlite3.IntegrityError:
+            conn.rollback()
+        else:
+            raise AssertionError(f"default target constraint was not enforced: {statement}")
+    conn.close()
+
+
+def assert_target_constraints_enforced(path, association=None):
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys=ON")
+    username, bank = association or ("alice", "science")
     invalid = (
         (
             "INSERT INTO bank_table (bank, shares) VALUES ('invalid-shares', 0)",
@@ -677,7 +861,7 @@ def assert_target_constraints_enforced(path):
         (
             "INSERT INTO site_fairshare_policy "
             "(username, bank, period, allocation) VALUES (?, ?, ?, ?)",
-            ("alice", "science", -1, 1.0),
+            (username, bank, -1, 1.0),
         ),
         (
             "INSERT INTO site_fairshare_policy "
@@ -695,27 +879,63 @@ def assert_target_constraints_enforced(path):
     conn.close()
 
 
-def test_migration(workspace, tmp):
+def test_migration(workspace, tmp, *, run_usage=True):
     target = tmp / "target schema.db"
     old = make_source_directory(tmp) / "old accounting data.db"
     create_target(target)
-    randomizer = random.Random(4815162342)
-    periods = [9, 0, 4, 2]
+    randomizer = random.SystemRandom()
+    hidden = secrets.token_hex(6)
+    hidden_target_table = f"site_target_{hidden}"
+    target_conn = sqlite3.connect(target)
+    target_conn.execute(
+        f"CREATE TABLE {quote(hidden_target_table)} ("
+        "generation INTEGER NOT NULL, cluster TEXT NOT NULL, "
+        "payload TEXT DEFAULT '' NOT NULL, "
+        "PRIMARY KEY (cluster, generation), "
+        "UNIQUE (generation, cluster), CHECK (generation >= 0))"
+    )
+    target_conn.commit()
+    target_conn.close()
+    periods = randomizer.sample(range(2, 2000), 4)
+    periods.insert(randomizer.randrange(len(periods) + 1), 0)
     associations = []
-    for username, userid, bank in (
-        ("alice", 1001, "science"),
-        ("alice", 1001, "root"),
-        ("bob", 1002, "science"),
-        ("carol", 1003, "root"),
-    ):
-        values = {period: round(randomizer.uniform(-1000, 1000), 7) for period in periods}
-        values[0] = 0.0 if username == "carol" else values[0]
+    shared_user = f"u-{hidden}-shared"
+    hidden_banks = (f"b-{hidden}-a", f"b-{hidden}-b")
+    identities = (
+        (shared_user, randomizer.randrange(10000, 90000), hidden_banks[0]),
+        (shared_user, randomizer.randrange(10000, 90000), hidden_banks[1]),
+        (f"u-{hidden}-c", randomizer.randrange(10000, 90000), hidden_banks[0]),
+        (f"u-{hidden}-d", randomizer.randrange(10000, 90000), hidden_banks[1]),
+    )
+    for index, (username, userid, bank) in enumerate(identities):
+        values = {
+            period: randomizer.uniform(-1_000_000, 1_000_000)
+            for period in periods
+        }
+        values[periods[index % len(periods)]] = (
+            5e-13 if index % 2 == 0 else -5e-13
+        )
+        if index == len(identities) - 1:
+            values[0] = 0.0
         associations.append((username, userid, bank, values))
     partial = [
-        ("alice", 1001, "science", 9, -999999.0),
-        ("bob", 1002, "science", 0, 123456.0),
+        (identities[0][0], identities[0][1], identities[0][2], periods[0], -999999.0),
+        (identities[2][0], identities[2][1], identities[2][2], periods[-1], 123456.0),
     ]
     expected = create_legacy(old, periods, associations, partial=partial)
+    hidden_source_table = f"site_source_{hidden}"
+    conn = sqlite3.connect(old)
+    conn.execute(
+        f"CREATE TABLE {quote(hidden_source_table)} ("
+        "setting TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    hidden_source_row = (f"setting-{hidden}", f"value-{secrets.token_hex(7)}")
+    conn.execute(
+        f"INSERT INTO {quote(hidden_source_table)} VALUES (?, ?)",
+        hidden_source_row,
+    )
+    conn.commit()
+    conn.close()
     conn = sqlite3.connect(old)
     target_conn = sqlite3.connect(target)
     preserved = capture_shared_rows(
@@ -731,55 +951,76 @@ def test_migration(workspace, tmp):
     assert backup.is_file()
     assert sha256(backup) == before_first
     assert_database_matches_target(old, target, expected, preserved)
-    assert_target_constraints_enforced(old)
+    conn = sqlite3.connect(old)
+    assert conn.execute(
+        f"SELECT setting, value FROM {quote(hidden_source_table)}"
+    ).fetchall() == [hidden_source_row]
+    conn.close()
+    assert_target_constraints_enforced(old, (identities[0][0], identities[0][2]))
     first_rows = usage_rows(sqlite3.connect(old))
     before_second = sha256(old)
     run(command)
     assert sha256(backup) == before_second
     assert_database_matches_target(old, target, expected, preserved)
     assert usage_rows(sqlite3.connect(old)) == first_rows
-    conn = sqlite3.connect(old)
-    conn.execute(
-        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("new-job", 1001, 5900, 6000, 6200, "0,1", "{}", "{}", "*", "science", 200, 200),
-    )
-    conn.commit()
-    conn.close()
-    update = run([workspace / "bin/flux-account-update-usage", "-p", old])
-    payload = json.loads(
-        update.stdout,
-        parse_constant=lambda value: (_ for _ in ()).throw(
-            ValueError(f"non-finite JSON number: {value}")
-        ),
-    )
-    assert set(payload) == {"database", "associations"}
-    assert payload["database"] == str(old)
-    assert isinstance(payload["associations"], list)
-    for row in payload["associations"]:
-        assert set(row) == {"username", "bank", "job_usage"}
-        assert isinstance(row["username"], str) and isinstance(row["bank"], str)
-        assert isinstance(row["job_usage"], (int, float))
-        assert math.isfinite(row["job_usage"])
-    expected_associations = {
-        ("alice", "science"),
-        ("alice", "root"),
-        ("bob", "science"),
-        ("carol", "root"),
-    }
-    assert {(row["username"], row["bank"]) for row in payload["associations"]} == (
-        expected_associations
-    )
-    conn = sqlite3.connect(old)
-    row_count = conn.execute(
-        "SELECT COUNT(*) FROM job_usage_per_association_table"
-    ).fetchone()[0]
-    conn.close()
-    run([workspace / "bin/flux-account-update-usage", "-p", old])
-    conn = sqlite3.connect(old)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM job_usage_per_association_table"
-    ).fetchone()[0] == row_count
-    conn.close()
+    if run_usage:
+        conn = sqlite3.connect(old)
+        conn.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"job-{hidden}",
+                identities[0][1],
+                5900,
+                6000,
+                6200,
+                "0,1",
+                "{}",
+                "{}",
+                "*",
+                identities[0][2],
+                200,
+                200,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        update = run([workspace / "bin/flux-account-update-usage", "-p", old])
+        payload = json.loads(
+            update.stdout,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number: {value}")
+            ),
+        )
+        assert set(payload) == {"database", "associations"}
+        assert payload["database"] == str(old)
+        assert isinstance(payload["associations"], list)
+        for row in payload["associations"]:
+            assert set(row) == {"username", "bank", "job_usage"}
+            assert isinstance(row["username"], str) and isinstance(row["bank"], str)
+            assert isinstance(row["job_usage"], (int, float))
+            assert math.isfinite(row["job_usage"])
+        expected_associations = {(row[0], row[2]) for row in identities}
+        assert {(row["username"], row["bank"]) for row in payload["associations"]} == (
+            expected_associations
+        )
+        conn = sqlite3.connect(old)
+        row_count = conn.execute(
+            "SELECT COUNT(*) FROM job_usage_per_association_table"
+        ).fetchone()[0]
+        conn.close()
+        run([workspace / "bin/flux-account-update-usage", "-p", old])
+        conn = sqlite3.connect(old)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM job_usage_per_association_table"
+        ).fetchone()[0] == row_count
+        conn.close()
+
+
+def test_hidden_randomized_migrations(workspace, tmp):
+    for index in range(3):
+        case = tmp / f"randomized-{index}"
+        case.mkdir()
+        test_migration(workspace, case, run_usage=False)
 
 
 def test_large_finite_usage_values(workspace, tmp):
@@ -801,8 +1042,8 @@ def test_large_finite_usage_values(workspace, tmp):
     conn = sqlite3.connect(old)
     observed = usage_rows(conn)
     for key, value in expected.items():
-        assert math.isfinite(observed[key])
-        assert observed[key] == value
+        assert math.isfinite(observed[key][0])
+        assert observed[key] == expected_sqlite_numeric(value)
         assert conn.execute(
             "SELECT typeof(value) FROM job_usage_per_association_table "
             "WHERE username=? AND bank=? AND period=?",
@@ -1246,26 +1487,48 @@ def test_public_help_interface(workspace, tmp):
 
 
 def test_default_target_schema(workspace, tmp):
+    trusted_target = tmp / "trusted default schema.db"
+    trusted_conn = sqlite3.connect(trusted_target)
+    trusted_conn.executescript(DEFAULT_TARGET_SCHEMA)
+    trusted_conn.close()
     old = make_source_directory(tmp) / "default target source.db"
-    periods = [7, 1]
+    randomizer = random.SystemRandom()
+    periods = randomizer.sample(range(20, 500), 3)
+    username = f"default-{secrets.token_hex(5)}"
     associations = [
-        ("default-user", 4101, "science", {7: 8.5, 1: -2.25}),
+        (
+            username,
+            randomizer.randrange(10000, 90000),
+            "science",
+            {
+                periods[0]: 5e-13,
+                periods[1]: -5e-13,
+                periods[2]: 0.12345678901234566,
+            },
+        ),
     ]
     expected = create_legacy(old, periods, associations)
+    legacy_conn = sqlite3.connect(old)
+    target_conn = sqlite3.connect(trusted_target)
+    preserved = capture_shared_rows(
+        legacy_conn,
+        target_conn,
+        excluded={"job_usage_per_association_table"},
+    )
+    legacy_conn.close()
+    target_conn.close()
     handoff(old)
     run([workspace / "bin/flux-account-update-db", "-p", old])
+    assert_schema_matches_target(old, trusted_target)
+    assert_default_schema_constraints_enforced(old)
     conn = sqlite3.connect(old)
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_VERSION
-    assert primary_key(conn, "job_usage_per_association_table") == [
-        "username",
-        "bank",
-        "period",
-    ]
+    assert_preserved_rows(conn, preserved)
     observed = usage_rows(conn)
     assert observed.keys() == expected.keys()
     for key, value in expected.items():
-        assert math.isclose(observed[key], value, rel_tol=0, abs_tol=1e-12), key
+        assert observed[key] == expected_sqlite_numeric(value), key
     conn.close()
     assert Path(str(old) + ".backup").is_file()
 
@@ -1276,6 +1539,7 @@ def main():
     args = parser.parse_args()
     workspace = args.workspace.resolve()
     assert_standard_library_only(workspace)
+    assert_no_verifier_fixture_fingerprints(workspace)
     assert_network_syscalls_blocked()
     with tempfile.TemporaryDirectory(prefix="flux-accounting-verifier-") as directory:
         root = Path(directory)
@@ -1284,6 +1548,7 @@ def main():
             ("public-help-interface", test_public_help_interface),
             ("stdlib-only-offline-execution", test_self_contained_without_network_dependencies),
             ("migration-and-retry", test_migration),
+            ("hidden-randomized-migrations", test_hidden_randomized_migrations),
             ("large-finite-usage-values", test_large_finite_usage_values),
             ("period-name-boundaries", test_period_name_boundaries),
             ("out-of-range-only-period-name", test_out_of_range_only_period_names),
