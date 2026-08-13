@@ -32,6 +32,10 @@ of the following requirements.
 - Every target table must retain its complete declared table definition,
   including ordered composite primary keys, UNIQUE constraints, CHECK
   constraints, and foreign keys.
+- Definition fidelity is checked against the target table's
+  `sqlite_master.sql` body from its opening `(` onward after collapsing runs of
+  whitespace. Column and constraint order therefore matter; only whitespace
+  formatting and the spelling/quoting of the table name before `(` are ignored.
 - For tables present in both databases, the final column set and primary key
   must match the target schema. Values in columns shared by both schemas must
   be preserved.
@@ -41,10 +45,14 @@ of the following requirements.
 
 ### Legacy usage migration
 
-The legacy `job_usage_factor_table` may contain zero or more columns named
-`usage_factor_period_N`, where `N` is a non-negative decimal integer. The
-columns may appear in any physical column order and the sequence of `N` values
-need not be contiguous.
+The legacy `job_usage_factor_table` may contain zero or more columns whose
+case-sensitive name is exactly `usage_factor_period_N`. `N` is the canonical
+base-10 spelling of an integer from `0` through `9223372036854775807`: either
+`0` or a nonzero ASCII digit followed by zero or more ASCII digits, with no
+leading zero. Names with a different case, non-ASCII digits, a leading zero,
+or an out-of-range suffix are not legacy period columns. The columns may appear
+in any physical column order and the sequence of `N` values need not be
+contiguous. The destination `period` is that suffix interpreted as an integer.
 
 For every legacy association `(username, userid, bank)` and every legacy
 period column, the upgraded `job_usage_per_association_table` must contain the
@@ -79,16 +87,32 @@ schema upgrade without inventing usage values.
   silently reusing it.
 - The backup must be a valid standalone SQLite database. Do not rely on an
   uncheckpointed WAL file beside it.
+- Failure before a fresh backup is atomically published must leave `OLD.db`
+  unchanged, must not restore an older `.backup` over it, and must leave any
+  pre-existing `.backup` intact.
 - If a migration operation fails after the fresh backup has been published —
   while reading the target schema, rebuilding or copying tables, migrating
   usage, initializing required configuration, or running final integrity and
   foreign-key checks — exit non-zero and leave `OLD.db` byte-for-byte equal to
-  `OLD.db.backup`.
+  `OLD.db.backup`. Remove transient `OLD.db-wal`, `OLD.db-shm`, and
+  `OLD.db-journal` sidecars before atomically restoring `OLD.db`; keep the fresh
+  `.backup` available.
 - A failed migration must not advance `PRAGMA user_version` or leave temporary
   tables in the restored database.
 - Missing source or target databases, and either input path being a directory or
   symbolic link rather than a regular file, must be rejected with a non-zero
   exit code before a migration begins.
+- When `-n` is omitted, the command must generate the bundled schema-version-37
+  target through the existing `fluxacct.accounting.create_db` interface.
+  When `-n` is supplied, `TARGET.db` must be a different physical file from
+  `OLD.db`; the same path or a hard link to the source must be rejected before
+  backup or migration work begins.
+
+The caller must provide exclusive access to both database files for the
+duration of the command. Concurrent readers/writers, forced termination,
+kernel failure, and power loss are outside the required failure model. The
+failure guarantees above apply to ordinary process errors and exceptions that
+the command can catch.
 
 ### Downstream compatibility
 
@@ -123,7 +147,9 @@ period rows.
 - Keep the database schema version at 37.
 - Use only Python's standard library and SQLite. The task is self-contained;
   installing packages or making the repair depend on network access is not
-  permitted.
+  permitted. Grading recursively inspects candidate files under `src/**` and
+  `bin/**`, rejects additions elsewhere, and runs candidate processes with
+  network socket creation blocked.
 - Do not weaken SQLite constraints, disable foreign-key handling, replace the
   migration with a database-specific hard-coded dump, or special-case the
   supplied fixture values.
@@ -143,6 +169,9 @@ Do not modify or replace:
 - `scripts/offline-check.sh`
 - `.dockerignore`, `.gitignore`, `Makefile`, `LICENSE`, `NOTICE.LLNS`,
   `DISCLAIMER.LLNS`, `UPSTREAM.md`, or `README.md`
+
+Adding files or directories anywhere outside `src/**` and `bin/**` also counts
+as modifying the protected surface and is rejected.
 
 The verifier supplies additional databases at grading time. It inspects the
 SQLite files independently and does not trust candidate-emitted summaries.

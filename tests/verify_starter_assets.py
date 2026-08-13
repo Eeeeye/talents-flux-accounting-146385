@@ -18,6 +18,13 @@ EXPECTED = {
     "scripts/offline-check.sh": "58196035deedd85135c40a3a724f3f13910febf094bdcb2d899074b7d3ab1f89",
     "scripts/reproduce-incident.sh": "fe1b752ef85bb23e661659478396af24c4b41acdc0229c1af24430f89900feef",
 }
+EDITABLE_ROOTS = {"bin", "src"}
+EXPECTED_DIRECTORIES = {
+    str(parent)
+    for relative in EXPECTED
+    for parent in Path(relative).parents
+    if str(parent) != "."
+}
 
 
 def sha256(path):
@@ -30,6 +37,26 @@ def sha256(path):
 
 def main():
     workspace = Path(sys.argv[1])
+    observed_protected_files = set()
+    for path in workspace.rglob("*"):
+        relative = path.relative_to(workspace)
+        if relative.parts[0] in EDITABLE_ROOTS:
+            continue
+        name = relative.as_posix()
+        if path.is_dir():
+            if name not in EXPECTED_DIRECTORIES:
+                raise SystemExit(
+                    f"path added outside the allowed src/** and bin/** surface: {name}"
+                )
+            continue
+        if name not in EXPECTED:
+            raise SystemExit(
+                f"file added outside the allowed src/** and bin/** surface: {name}"
+            )
+        observed_protected_files.add(name)
+    missing = set(EXPECTED) - observed_protected_files
+    if missing:
+        raise SystemExit(f"protected starter assets are missing: {sorted(missing)}")
     for relative, expected in EXPECTED.items():
         path = workspace / relative
         if not path.is_file() or path.is_symlink():

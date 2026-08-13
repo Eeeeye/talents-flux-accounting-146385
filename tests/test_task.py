@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import ast
+import ctypes
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import platform
 import random
 import re
 import shutil
@@ -36,6 +39,7 @@ NETWORK_SHELL = re.compile(
     r"|\bpython(?:3)?\s+-m\s+pip\b",
     re.MULTILINE,
 )
+SOURCE_ROOTS = ("src", "bin", "scripts")
 EXPECTED_HELP_FRAGMENTS = (
     "usage:",
     "[-p OLD_DB]",
@@ -76,6 +80,53 @@ def candidate_preexec():
         os.setgroups([])
         os.setgid(CANDIDATE_GID)
         os.setuid(CANDIDATE_UID)
+    install_network_seccomp_filter()
+
+
+def install_network_seccomp_filter():
+    syscall_numbers = {
+        "x86_64": (41, 53),
+        "amd64": (41, 53),
+        "aarch64": (198, 199),
+        "arm64": (198, 199),
+    }.get(platform.machine().lower())
+    if syscall_numbers is None:
+        raise RuntimeError(
+            f"unsupported verifier architecture for network isolation: {platform.machine()}"
+        )
+
+    class SockFilter(ctypes.Structure):
+        _fields_ = [
+            ("code", ctypes.c_ushort),
+            ("jt", ctypes.c_ubyte),
+            ("jf", ctypes.c_ubyte),
+            ("k", ctypes.c_uint32),
+        ]
+
+    class SockFprog(ctypes.Structure):
+        _fields_ = [
+            ("len", ctypes.c_ushort),
+            ("filter", ctypes.POINTER(SockFilter)),
+        ]
+
+    instructions = [SockFilter(0x20, 0, 0, 0)]
+    for syscall_number in syscall_numbers:
+        instructions.extend(
+            (
+                SockFilter(0x15, 0, 1, syscall_number),
+                SockFilter(0x06, 0, 0, 0x00050000 | errno.EPERM),
+            )
+        )
+    instructions.append(SockFilter(0x06, 0, 0, 0x7FFF0000))
+    filters = (SockFilter * len(instructions))(*instructions)
+    program = SockFprog(len(instructions), filters)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if libc.prctl(22, 2, ctypes.byref(program)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 def candidate_owner():
@@ -224,9 +275,48 @@ def assert_preserved_rows(conn, snapshots):
         assert sorted(observed_rows, key=repr) == expected_rows, table
 
 
+def candidate_source_files(workspace):
+    paths = []
+    for relative in SOURCE_ROOTS:
+        root = workspace / relative
+        assert root.is_dir() and not root.is_symlink(), (
+            f"candidate source root is missing or unsafe: {relative}"
+        )
+        for path in root.rglob("*"):
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise AssertionError(f"unsafe candidate source path: {path}")
+            if path.is_file():
+                paths.append(path)
+    return sorted(paths)
+
+
+def local_module_names(workspace):
+    names = {"fluxacct"}
+    for relative in SOURCE_ROOTS:
+        root = workspace / relative
+        for path in root.iterdir():
+            if path.is_dir():
+                names.add(path.name)
+            elif path.suffix == ".py":
+                names.add(path.stem)
+    return names
+
+
 def assert_standard_library_only(workspace):
-    for path in sorted((workspace / "src").rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
+    local_modules = local_module_names(workspace)
+    for path in candidate_source_files(workspace):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            raise AssertionError(f"candidate source is not readable UTF-8 text: {path}") from exc
+        assert "\x00" not in text, f"binary candidate source is not permitted: {path}"
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError:
+            assert not NETWORK_SHELL.search(text), (
+                f"network command in candidate source: {path}"
+            )
+            continue
         imported = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -236,17 +326,27 @@ def assert_standard_library_only(workspace):
         external = {
             name
             for name in imported
-            if name != "fluxacct" and name not in sys.stdlib_module_names
+            if name not in local_modules and name not in sys.stdlib_module_names
         }
         assert not external, f"non-standard dependency in {path}: {sorted(external)}"
         assert not imported & NETWORK_IMPORTS, (
             f"network dependency in {path}: {sorted(imported & NETWORK_IMPORTS)}"
         )
-    for path in sorted((workspace / "bin").iterdir()):
-        if path.is_file():
-            assert not NETWORK_SHELL.search(path.read_text()), (
-                f"network command in public executable: {path}"
-            )
+        assert not NETWORK_SHELL.search(text), (
+            f"network command in candidate source: {path}"
+        )
+
+
+def assert_network_syscalls_blocked():
+    probe = (
+        "import errno, socket, sys\n"
+        "try:\n"
+        "    socket.socket()\n"
+        "except OSError as exc:\n"
+        "    sys.exit(0 if exc.errno == errno.EPERM else 2)\n"
+        "sys.exit(3)\n"
+    )
+    run([sys.executable, "-B", "-c", probe])
 
 
 def create_target(path):
@@ -711,6 +811,60 @@ def test_large_finite_usage_values(workspace, tmp):
     conn.close()
 
 
+def test_period_name_boundaries(workspace, tmp):
+    target = tmp / "period-name target.db"
+    old = make_source_directory(tmp) / "period-name source.db"
+    create_target(target)
+    maximum_period = 9223372036854775807
+    expected = create_legacy(
+        old,
+        [maximum_period],
+        [("period-boundary", 6001, "science", {maximum_period: 17.25})],
+    )
+    conn = sqlite3.connect(old)
+    ignored_columns = (
+        "usage_factor_period_01",
+        "Usage_factor_period_7",
+        "usage_factor_period_9223372036854775808",
+        "usage_factor_period_١",
+    )
+    for index, column in enumerate(ignored_columns, start=1):
+        conn.execute(
+            f"ALTER TABLE job_usage_factor_table ADD COLUMN {quote(column)} REAL"
+        )
+        conn.execute(
+            f"UPDATE job_usage_factor_table SET {quote(column)}=?",
+            (index * 100.5,),
+        )
+    conn.commit()
+    conn.close()
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    assert_database_matches_target(old, target, expected)
+    conn = sqlite3.connect(old)
+    assert conn.execute(
+        "SELECT period, typeof(period) FROM job_usage_per_association_table"
+    ).fetchall() == [(maximum_period, "integer")]
+    conn.close()
+
+
+def test_out_of_range_only_period_names(workspace, tmp):
+    target = tmp / "ignored-period target.db"
+    old = make_source_directory(tmp) / "ignored-period source.db"
+    create_target(target)
+    create_legacy(old, [], [], no_periods=True)
+    conn = sqlite3.connect(old)
+    conn.execute(
+        "ALTER TABLE job_usage_factor_table ADD COLUMN "
+        '"usage_factor_period_9223372036854775808" REAL'
+    )
+    conn.commit()
+    conn.close()
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    assert_database_matches_target(old, target, {})
+
+
 def test_no_periods(workspace, tmp):
     target = tmp / "target.db"
     old = make_source_directory(tmp) / "old.db"
@@ -724,6 +878,65 @@ def test_no_periods(workspace, tmp):
     conn = sqlite3.connect(old)
     assert conn.execute("SELECT COUNT(*) FROM association_table").fetchone()[0] == 1
     conn.close()
+
+
+def test_empty_association_layouts(workspace, tmp):
+    layouts = (
+        ("sparse-period-columns", [23, 1, 9], False),
+        ("no-period-columns", [], True),
+    )
+    for index, (name, periods, no_periods) in enumerate(layouts):
+        case = tmp / f"empty-{index}-{name}"
+        case.mkdir()
+        target = case / "target schema.db"
+        old = make_source_directory(case) / "empty associations.db"
+        create_target(target)
+        expected = create_legacy(
+            old, periods, [], no_periods=no_periods
+        )
+        old_conn = sqlite3.connect(old)
+        target_conn = sqlite3.connect(target)
+        preserved = capture_shared_rows(
+            old_conn,
+            target_conn,
+            excluded={"job_usage_per_association_table"},
+        )
+        old_conn.close()
+        target_conn.close()
+        handoff(old)
+
+        command = [
+            workspace / "bin/flux-account-update-db",
+            "-p",
+            old,
+            "-n",
+            target,
+        ]
+        before_first = sha256(old)
+        run(command)
+        backup = Path(str(old) + ".backup")
+        assert backup.is_file() and sha256(backup) == before_first
+        backup_conn = sqlite3.connect(backup)
+        assert backup_conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        backup_conn.close()
+        assert_database_matches_target(old, target, expected, preserved)
+        conn = sqlite3.connect(old)
+        assert conn.execute("SELECT COUNT(*) FROM association_table").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM job_usage_factor_table").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM job_usage_per_association_table"
+        ).fetchone()[0] == 0
+        conn.close()
+
+        before_second = sha256(old)
+        run(command)
+        assert sha256(backup) == before_second
+        assert_database_matches_target(old, target, expected, preserved)
+        update = run([workspace / "bin/flux-account-update-usage", "-p", old])
+        assert json.loads(update.stdout) == {
+            "database": str(old),
+            "associations": [],
+        }
 
 
 def assert_post_validation_failure_restored(workspace, old, target, *, stale=False):
@@ -748,6 +961,8 @@ def assert_post_validation_failure_restored(workspace, old, target, *, stale=Fal
         "SELECT 1 FROM sqlite_master WHERE name LIKE '%_tmp' LIMIT 1"
     ).fetchone()
     conn.close()
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(str(old) + suffix).exists()
 
 
 def test_post_backup_failure_restore_matrix(workspace, tmp):
@@ -957,10 +1172,48 @@ def test_invalid_paths(workspace, tmp):
     )
     assert result.returncode != 0
     assert not Path(str(symlink) + ".backup").exists()
+    same_file_before = sha256(old)
+    result = run(
+        [workspace / "bin/flux-account-update-db", "-p", old, "-n", old],
+        expect=None,
+    )
+    assert result.returncode != 0
+    assert sha256(old) == same_file_before
+    assert not backup.exists()
+    target_hardlink = source / "same-physical-file.db"
+    os.link(old, target_hardlink)
+    result = run(
+        [workspace / "bin/flux-account-update-db", "-p", old, "-n", target_hardlink],
+        expect=None,
+    )
+    assert result.returncode != 0
+    assert sha256(old) == same_file_before
+    assert not backup.exists()
+
+
+def test_pre_backup_failure_preserves_source(workspace, tmp):
+    source = make_source_directory(tmp)
+    old = source / "invalid sqlite.db"
+    old.write_bytes(b"not-a-sqlite-database")
+    handoff(old)
+    backup = Path(str(old) + ".backup")
+    backup.write_bytes(b"stale-backup-from-an-earlier-run")
+    handoff(backup)
+    target = tmp / "target.db"
+    create_target(target)
+    before_old = sha256(old)
+    before_backup = sha256(backup)
+    result = run(
+        [workspace / "bin/flux-account-update-db", "-p", old, "-n", target],
+        expect=None,
+    )
+    assert result.returncode != 0
+    assert sha256(old) == before_old
+    assert sha256(backup) == before_backup
+    assert not Path(str(backup) + ".tmp").exists()
 
 
 def test_self_contained_without_network_dependencies(workspace, tmp):
-    assert_standard_library_only(workspace)
     target = tmp / "offline target.db"
     old = make_source_directory(tmp) / "offline source.db"
     create_target(target)
@@ -1022,6 +1275,8 @@ def main():
     parser.add_argument("--workspace", type=Path, required=True)
     args = parser.parse_args()
     workspace = args.workspace.resolve()
+    assert_standard_library_only(workspace)
+    assert_network_syscalls_blocked()
     with tempfile.TemporaryDirectory(prefix="flux-accounting-verifier-") as directory:
         root = Path(directory)
         root.chmod(0o711)
@@ -1030,10 +1285,14 @@ def main():
             ("stdlib-only-offline-execution", test_self_contained_without_network_dependencies),
             ("migration-and-retry", test_migration),
             ("large-finite-usage-values", test_large_finite_usage_values),
+            ("period-name-boundaries", test_period_name_boundaries),
+            ("out-of-range-only-period-name", test_out_of_range_only_period_names),
             ("no-period-layout", test_no_periods),
+            ("empty-association-layouts", test_empty_association_layouts),
             ("post-backup-failure-restore-matrix", test_post_backup_failure_restore_matrix),
             ("wal-backup", test_wal_backup),
             ("invalid-paths", test_invalid_paths),
+            ("pre-backup-failure-preserves-source", test_pre_backup_failure_preserves_source),
             ("default-target-schema", test_default_target_schema),
         ]
         for index, (name, check) in enumerate(checks):

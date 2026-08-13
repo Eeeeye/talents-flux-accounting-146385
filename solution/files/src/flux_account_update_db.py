@@ -29,6 +29,8 @@ CREATE_TABLE_PREFIX = re.compile(
     r'(?:"(?:[^"]|"")*"|`[^`]*`|\[[^\]]+\]|[^\s(]+)',
     re.IGNORECASE | re.DOTALL,
 )
+PERIOD_COLUMN = re.compile(r"^usage_factor_period_(0|[1-9][0-9]*)$")
+SQLITE_MAX_INTEGER = 9223372036854775807
 
 
 def set_db_loc(args):
@@ -191,9 +193,11 @@ def legacy_usage(cur):
     columns = cur.execute("PRAGMA table_info(job_usage_factor_table)").fetchall()
     period_columns = []
     for column in columns:
-        prefix = "usage_factor_period_"
-        if column[1].startswith(prefix) and column[1][len(prefix):].isdigit():
-            period_columns.append((column[1], int(column[1][len(prefix):])))
+        match = PERIOD_COLUMN.fullmatch(column[1])
+        if match is not None:
+            period = int(match.group(1))
+            if period <= SQLITE_MAX_INTEGER:
+                period_columns.append((column[1], period))
     if not period_columns:
         return []
     selected = ["username", "userid", "bank"] + [item[0] for item in period_columns]
@@ -233,18 +237,37 @@ def write_backup(source, backup):
     shutil.copy2(source, backup)
 
 
+def restore_backup(source, backup):
+    directory = os.path.dirname(os.path.abspath(source))
+    prefix = os.path.basename(source) + ".restore-"
+    descriptor, restore_tmp = tempfile.mkstemp(prefix=prefix, dir=directory)
+    os.close(descriptor)
+    try:
+        shutil.copyfile(backup, restore_tmp)
+        os.replace(restore_tmp, source)
+    finally:
+        if os.path.exists(restore_tmp):
+            os.unlink(restore_tmp)
+
+
 def update_db(path, new_db):
     if os.path.islink(path) or not os.path.isfile(path):
         raise ValueError(f"Database file does not exist or is not regular: {path}")
     if new_db is not None and (os.path.islink(new_db) or not os.path.isfile(new_db)):
         raise ValueError(f"Target schema does not exist or is not regular: {new_db}")
+    if new_db is not None and os.path.samefile(path, new_db):
+        raise ValueError("Source database and target schema must be different files")
     backup_path = path + ".backup"
     backup_tmp = backup_path + ".tmp"
-    if os.path.exists(backup_tmp):
-        os.unlink(backup_tmp)
+    backup_published = False
     try:
+        if os.path.lexists(backup_tmp):
+            if os.path.islink(backup_tmp) or not os.path.isfile(backup_tmp):
+                raise ValueError(f"Unsafe temporary backup path: {backup_tmp}")
+            os.unlink(backup_tmp)
         write_backup(path, backup_tmp)
         os.replace(backup_tmp, backup_path)
+        backup_published = True
         with tempfile.TemporaryDirectory() as directory:
             if new_db is None:
                 target_path = os.path.join(directory, "target.db")
@@ -283,12 +306,12 @@ def update_db(path, new_db):
                 old_conn.close()
                 new_conn.close()
     except BaseException:
-        if os.path.isfile(backup_path):
+        if backup_published and os.path.isfile(backup_path):
             for suffix in ("-wal", "-shm", "-journal"):
                 sidecar = path + suffix
                 if os.path.exists(sidecar):
                     os.unlink(sidecar)
-            shutil.copyfile(backup_path, path)
+            restore_backup(path, backup_path)
         if os.path.exists(backup_tmp):
             os.unlink(backup_tmp)
         raise
