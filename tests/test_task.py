@@ -1413,6 +1413,32 @@ def test_invalid_paths(workspace, tmp):
     )
     assert result.returncode != 0
     assert not Path(str(symlink) + ".backup").exists()
+
+    implicit_source = make_source_directory(tmp, "implicit-symlink-source")
+    implicit_real = implicit_source / "real source.db"
+    create_legacy(
+        implicit_real,
+        [2],
+        [("implicit-link", 7001, "science", {2: 8.5})],
+    )
+    handoff(implicit_real)
+    implicit_backup = Path(str(implicit_real) + ".backup")
+    implicit_backup.write_bytes(b"pre-existing-backup-must-remain-unchanged")
+    handoff(implicit_backup)
+    implicit_link = implicit_source / "linked source.db"
+    implicit_link.symlink_to(implicit_real)
+    before_implicit_real = sha256(implicit_real)
+    before_implicit_backup = sha256(implicit_backup)
+    result = run(
+        [workspace / "bin/flux-account-update-db", "-p", implicit_link],
+        expect=None,
+    )
+    assert result.returncode != 0
+    assert implicit_link.is_symlink()
+    assert sha256(implicit_real) == before_implicit_real
+    assert sha256(implicit_backup) == before_implicit_backup
+    assert not Path(str(implicit_link) + ".backup").exists()
+
     same_file_before = sha256(old)
     result = run(
         [workspace / "bin/flux-account-update-db", "-p", old, "-n", old],
@@ -1533,6 +1559,42 @@ def test_default_target_schema(workspace, tmp):
     assert Path(str(old) + ".backup").is_file()
 
 
+def test_target_only_column_values(workspace, tmp):
+    target = tmp / "target-only column schema.db"
+    old = make_source_directory(tmp) / "target-only column source.db"
+    create_target(target)
+    expected_default = f"target-default-{secrets.token_hex(8)}"
+    target_conn = sqlite3.connect(target)
+    target_conn.execute(
+        "ALTER TABLE queue_table ADD COLUMN target_only_default TEXT "
+        f"DEFAULT '{expected_default}' NOT NULL"
+    )
+    target_conn.execute(
+        "ALTER TABLE queue_table ADD COLUMN target_only_nullable TEXT"
+    )
+    target_conn.commit()
+    target_conn.close()
+    create_legacy(
+        old,
+        [11],
+        [("column-values", 7101, "science", {11: 4.25})],
+    )
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    assert_schema_matches_target(old, target)
+    conn = sqlite3.connect(old)
+    assert conn.execute(
+        "SELECT mod_time, active, fairshare FROM association_table "
+        "WHERE username='column-values' AND bank='science'"
+    ).fetchone() == (0, 1, 0.5)
+    assert conn.execute(
+        "SELECT queue, priority, target_only_default, target_only_nullable "
+        "FROM queue_table WHERE queue='batch'"
+    ).fetchone() == ("batch", 3, expected_default, None)
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", type=Path, required=True)
@@ -1559,6 +1621,7 @@ def main():
             ("invalid-paths", test_invalid_paths),
             ("pre-backup-failure-preserves-source", test_pre_backup_failure_preserves_source),
             ("default-target-schema", test_default_target_schema),
+            ("target-only-column-values", test_target_only_column_values),
         ]
         for index, (name, check) in enumerate(checks):
             case = root / f"case-{index}"

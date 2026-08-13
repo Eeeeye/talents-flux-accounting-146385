@@ -1,5 +1,5 @@
-DB_DIR = "@X_LOCALSTATEDIR@/lib/flux/"
-DB_PATH = "@X_LOCALSTATEDIR@/lib/flux/FluxAccounting.db"
+DB_DIR = "/workspace/flux-accounting/"
+DB_PATH = "/workspace/flux-accounting/FluxAccounting.db"
 DB_SCHEMA_VERSION = 37
 
 PRIORITY_FACTORS = ["fairshare", "queue", "bank", "urgency"]
