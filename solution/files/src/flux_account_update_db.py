@@ -12,6 +12,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import sys
@@ -21,6 +22,13 @@ from argparse import RawDescriptionHelpFormatter
 
 import fluxacct.accounting
 from fluxacct.accounting import create_db as c
+
+
+CREATE_TABLE_PREFIX = re.compile(
+    r"^(\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)"
+    r'(?:"(?:[^"]|"")*"|`[^`]*`|\[[^\]]+\]|[^\s(]+)',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def set_db_loc(args):
@@ -45,38 +53,45 @@ def get_cols_list(old_columns, new_columns):
     return list(new_columns)
 
 
-def column_definition(column):
-    _, name, declared_type, not_null, default_value, _ = column
-    parts = [quote(name)]
-    if declared_type:
-        parts.append(declared_type)
-    if default_value is not None:
-        parts.extend(("DEFAULT", default_value))
-    if not_null:
-        parts.append("NOT NULL")
-    return " ".join(parts)
-
-
-def create_table_from_info(cur, table_name, columns):
-    definitions = [column_definition(column) for column in columns]
-    primary_keys = [
-        column[1]
-        for column in sorted(columns, key=lambda column: column[5])
-        if column[5] > 0
-    ]
-    if primary_keys:
-        definitions.append(
-            "PRIMARY KEY (" + ", ".join(quote(key) for key in primary_keys) + ")"
+def table_sql(cur, table_name):
+    row = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    if row is None or not row[0]:
+        raise sqlite3.OperationalError(
+            f"target table has no reusable CREATE TABLE definition: {table_name}"
         )
-    cur.execute(
-        f"CREATE TABLE {quote(table_name)} (" + ", ".join(definitions) + ")"
+    return row[0]
+
+
+def table_definition(cur, table_name):
+    sql = table_sql(cur, table_name)
+    opening = sql.find("(")
+    if opening < 0:
+        raise sqlite3.OperationalError(
+            f"target table has malformed CREATE TABLE definition: {table_name}"
+        )
+    return re.sub(r"\s+", " ", sql[opening:]).strip()
+
+
+def create_table_from_schema(old_cur, new_cur, source_name, destination_name=None):
+    destination_name = destination_name or source_name
+    sql = table_sql(new_cur, source_name)
+    rewritten, count = CREATE_TABLE_PREFIX.subn(
+        lambda match: match.group(1) + quote(destination_name), sql, count=1
     )
+    if count != 1:
+        raise sqlite3.OperationalError(
+            f"cannot retarget CREATE TABLE definition for {source_name}"
+        )
+    old_cur.execute(rewritten)
 
 
-def add_tmp_table_to_db(old_cur, table, cols):
-    tmp_name = table[0] + "_tmp"
+def add_tmp_table_to_db(old_cur, new_cur, table_name):
+    tmp_name = table_name + "_tmp"
     old_cur.execute(f"DROP TABLE IF EXISTS {quote(tmp_name)}")
-    create_table_from_info(old_cur, tmp_name, cols)
+    create_table_from_schema(old_cur, new_cur, table_name, tmp_name)
 
 
 def move_existing_rows(old_cur, cols, old_columns, table):
@@ -114,10 +129,7 @@ def update_tables(old_cur, new_cur):
     ]
     for table in new_tables:
         if table not in old_tables:
-            columns = new_cur.execute(
-                f"PRAGMA table_info({quote(table)})"
-            ).fetchall()
-            create_table_from_info(old_cur, table, columns)
+            create_table_from_schema(old_cur, new_cur, table)
 
 
 def update_columns(old_cur, new_cur):
@@ -139,9 +151,12 @@ def update_columns(old_cur, new_cur):
             continue
         old_signature = [row[1:6] for row in old_columns]
         new_signature = [row[1:6] for row in new_columns]
-        if old_signature == new_signature:
+        if (
+            old_signature == new_signature
+            and table_definition(old_cur, table) == table_definition(new_cur, table)
+        ):
             continue
-        add_tmp_table_to_db(old_cur, (table,), new_columns)
+        add_tmp_table_to_db(old_cur, new_cur, table)
         move_existing_rows(old_cur, new_columns, old_columns, (table,))
         rename_tmp_table(old_cur, (table,))
 
@@ -253,6 +268,13 @@ def update_db(path, new_db):
                 )
                 if old_conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise sqlite3.IntegrityError("post-migration integrity check failed")
+                foreign_key_errors = old_conn.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if foreign_key_errors:
+                    raise sqlite3.IntegrityError(
+                        f"post-migration foreign key check failed: {foreign_key_errors}"
+                    )
                 old_conn.commit()
             except BaseException:
                 old_conn.rollback()
@@ -262,6 +284,10 @@ def update_db(path, new_db):
                 new_conn.close()
     except BaseException:
         if os.path.isfile(backup_path):
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = path + suffix
+                if os.path.exists(sidecar):
+                    os.unlink(sidecar)
             shutil.copyfile(backup_path, path)
         if os.path.exists(backup_tmp):
             os.unlink(backup_tmp)

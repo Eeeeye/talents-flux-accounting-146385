@@ -36,6 +36,15 @@ NETWORK_SHELL = re.compile(
     r"|\bpython(?:3)?\s+-m\s+pip\b",
     re.MULTILINE,
 )
+EXPECTED_HELP_FRAGMENTS = (
+    "usage:",
+    "[-p OLD_DB]",
+    "[-n NEW_DB]",
+    "-p, --path OLD_DB",
+    "database file",
+    "-n, --new-db NEW_DB",
+    "target schema",
+)
 
 
 def terminate_candidate_processes():
@@ -153,6 +162,31 @@ def primary_key(conn, table):
     ]
 
 
+def normalized_table_sql(conn, table):
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    assert row is not None and row[0], table
+    opening = row[0].find("(")
+    assert opening >= 0, table
+    return re.sub(r"\s+", " ", row[0][opening:]).strip()
+
+
+def explicit_indexes(conn, table):
+    indexes = []
+    for row in conn.execute(f"PRAGMA index_list({quote(table)})"):
+        sequence, name, unique, origin, partial = row
+        if origin == "pk":
+            continue
+        columns = tuple(
+            item[2]
+            for item in conn.execute(f"PRAGMA index_xinfo({quote(name)})")
+            if item[5] and item[2] is not None
+        )
+        indexes.append((unique, origin, partial, columns))
+    return sorted(indexes, key=repr)
+
+
 def user_tables(conn):
     return {
         row[0]
@@ -240,7 +274,9 @@ def create_target(path):
             shares INTEGER NOT NULL,
             job_usage REAL DEFAULT 0.0 NOT NULL,
             priority REAL DEFAULT 0.0 NOT NULL,
-            ignore_older_than INTEGER DEFAULT 0
+            ignore_older_than INTEGER DEFAULT 0,
+            UNIQUE (bank),
+            CHECK (shares > 0)
         );
         CREATE TABLE job_usage_factor_table (
             username TEXT NOT NULL,
@@ -300,13 +336,20 @@ def create_target(path):
             period INTEGER NOT NULL,
             username TEXT NOT NULL,
             allocation REAL DEFAULT 0.0 NOT NULL,
-            PRIMARY KEY (username, bank, period)
+            PRIMARY KEY (username, bank, period),
+            UNIQUE (bank, period, username),
+            CHECK (period >= 0),
+            CHECK (allocation >= 0),
+            FOREIGN KEY (username, bank)
+                REFERENCES association_table (username, bank)
         );
         CREATE TABLE "target schema marker" (
             generation INTEGER NOT NULL,
             cluster TEXT NOT NULL,
             note TEXT DEFAULT '' NOT NULL,
-            PRIMARY KEY (cluster, generation)
+            PRIMARY KEY (cluster, generation),
+            UNIQUE (generation, cluster),
+            CHECK (generation >= 0)
         );
         """
     )
@@ -404,10 +447,6 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
     conn.execute("INSERT INTO queue_table (queue, priority, obsolete) VALUES ('batch', 3, 77)")
     conn.execute("INSERT INTO t_half_life_period_table VALUES ('cluster', 4102444800)")
     conn.execute(
-        "INSERT INTO site_fairshare_policy VALUES "
-        "('science', 4, 'alice', 13.5, 'preserve-shared-columns')"
-    )
-    conn.execute(
         "INSERT INTO site_local_metadata VALUES "
         "('scheduler-owner', 'site-extension-must-survive')"
     )
@@ -439,6 +478,12 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
             f"INSERT INTO job_usage_factor_table ({','.join(map(quote, columns))}) "
             f"VALUES ({','.join('?' for _ in row)})",
             row,
+        )
+    if associations:
+        username, _, bank, _ = associations[0]
+        conn.execute(
+            "INSERT INTO site_fairshare_policy VALUES (?, 4, ?, 13.5, ?)",
+            (bank, username, "preserve-shared-columns"),
         )
     if partial is not None:
         conn.executescript(
@@ -485,6 +530,17 @@ def assert_database_matches_target(path, target, expected, preserved=None):
             row[1:6] for row in table_info(target_conn, table)
         ], table
         assert primary_key(conn, table) == primary_key(target_conn, table), table
+        assert normalized_table_sql(conn, table) == normalized_table_sql(
+            target_conn, table
+        ), table
+        assert conn.execute(f"PRAGMA foreign_key_list({quote(table)})").fetchall() == (
+            target_conn.execute(
+                f"PRAGMA foreign_key_list({quote(table)})"
+            ).fetchall()
+        ), table
+        assert explicit_indexes(conn, table) == explicit_indexes(
+            target_conn, table
+        ), table
     assert primary_key(conn, "migration_marker") == ["cluster", "generation"]
     assert primary_key(conn, "site_fairshare_policy") == [
         "username",
@@ -502,11 +558,41 @@ def assert_database_matches_target(path, target, expected, preserved=None):
     assert conn.execute(
         "SELECT setting, value FROM site_local_metadata"
     ).fetchall() == [("scheduler-owner", "site-extension-must-survive")]
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     expected_associations = len({(key[0], key[2]) for key in expected})
     if expected_associations:
         assert conn.execute("SELECT COUNT(*) FROM association_table").fetchone()[0] == expected_associations
     conn.close()
     target_conn.close()
+
+
+def assert_target_constraints_enforced(path):
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys=ON")
+    invalid = (
+        (
+            "INSERT INTO bank_table (bank, shares) VALUES ('invalid-shares', 0)",
+            (),
+        ),
+        (
+            "INSERT INTO site_fairshare_policy "
+            "(username, bank, period, allocation) VALUES (?, ?, ?, ?)",
+            ("alice", "science", -1, 1.0),
+        ),
+        (
+            "INSERT INTO site_fairshare_policy "
+            "(username, bank, period, allocation) VALUES (?, ?, ?, ?)",
+            ("missing-user", "science", 3, 1.0),
+        ),
+    )
+    for statement, values in invalid:
+        try:
+            conn.execute(statement, values)
+        except sqlite3.IntegrityError:
+            conn.rollback()
+        else:
+            raise AssertionError(f"target constraint was not enforced: {statement}")
+    conn.close()
 
 
 def test_migration(workspace, tmp):
@@ -545,6 +631,7 @@ def test_migration(workspace, tmp):
     assert backup.is_file()
     assert sha256(backup) == before_first
     assert_database_matches_target(old, target, expected, preserved)
+    assert_target_constraints_enforced(old)
     first_rows = usage_rows(sqlite3.connect(old))
     before_second = sha256(old)
     run(command)
@@ -663,7 +750,7 @@ def assert_post_validation_failure_restored(workspace, old, target, *, stale=Fal
     conn.close()
 
 
-def test_post_validation_failure_restore_matrix(workspace, tmp):
+def test_post_backup_failure_restore_matrix(workspace, tmp):
     cases = []
 
     constraint_target = tmp / "constraint target.db"
@@ -707,6 +794,72 @@ def test_post_validation_failure_restore_matrix(workspace, tmp):
         [("carol", 1003, "science", {8: -11.25})],
     )
     cases.append((corrupt_old, corrupt_target, False))
+
+    usage_target = tmp / "usage target.db"
+    usage_old = make_source_directory(tmp, "usage-source") / "old.db"
+    create_target(usage_target)
+    create_legacy(
+        usage_old,
+        [5],
+        [("dave", 1004, "science", {5: 6.25})],
+    )
+    target_conn = sqlite3.connect(usage_target)
+    target_conn.execute("DROP TABLE job_usage_per_association_table")
+    target_conn.execute(
+        "CREATE TABLE job_usage_per_association_table ("
+        "username TEXT NOT NULL, userid INTEGER NOT NULL, bank TEXT NOT NULL, "
+        "period INTEGER NOT NULL, value REAL DEFAULT 0.0, "
+        "PRIMARY KEY (username, bank, period), CHECK (value < 0))"
+    )
+    target_conn.commit()
+    target_conn.close()
+    cases.append((usage_old, usage_target, False))
+
+    init_target = tmp / "initializer target.db"
+    init_old = make_source_directory(tmp, "initializer-source") / "old.db"
+    create_target(init_target)
+    create_legacy(
+        init_old,
+        [2],
+        [("erin", 1005, "root", {2: 3.5})],
+    )
+    target_conn = sqlite3.connect(init_target)
+    target_conn.execute("DROP TABLE config_table")
+    target_conn.execute(
+        "CREATE TABLE config_table (key TEXT PRIMARY KEY NOT NULL, "
+        "value TEXT NOT NULL CHECK (key != 'decay_factor'))"
+    )
+    target_conn.commit()
+    target_conn.close()
+    cases.append((init_old, init_target, False))
+
+    foreign_key_target = tmp / "foreign key target.db"
+    foreign_key_old = make_source_directory(tmp, "foreign-key-source") / "old.db"
+    create_target(foreign_key_target)
+    create_legacy(
+        foreign_key_old,
+        [3],
+        [("frank", 1006, "science", {3: 4.75})],
+    )
+    old_conn = sqlite3.connect(foreign_key_old)
+    old_conn.execute(
+        "UPDATE site_fairshare_policy SET username='missing-parent'"
+    )
+    old_conn.commit()
+    old_conn.close()
+    target_conn = sqlite3.connect(foreign_key_target)
+    target_conn.execute("DROP TABLE site_fairshare_policy")
+    target_conn.execute(
+        "CREATE TABLE site_fairshare_policy ("
+        "bank TEXT NOT NULL, period INTEGER NOT NULL, username TEXT NOT NULL, "
+        "allocation REAL DEFAULT 0.0 NOT NULL, "
+        "PRIMARY KEY (username, bank, period), "
+        "FOREIGN KEY (username, bank) REFERENCES association_table "
+        "(username, bank) DEFERRABLE INITIALLY DEFERRED)"
+    )
+    target_conn.commit()
+    target_conn.close()
+    cases.append((foreign_key_old, foreign_key_target, False))
 
     for old, target, stale in cases:
         assert_post_validation_failure_restored(
@@ -831,6 +984,14 @@ def test_self_contained_without_network_dependencies(workspace, tmp):
     assert_database_matches_target(old, target, expected)
 
 
+def test_public_help_interface(workspace, tmp):
+    del tmp
+    result = run([workspace / "bin/flux-account-update-db", "--help"])
+    for fragment in EXPECTED_HELP_FRAGMENTS:
+        assert fragment in result.stdout, fragment
+    assert result.stderr == ""
+
+
 def test_default_target_schema(workspace, tmp):
     old = make_source_directory(tmp) / "default target source.db"
     periods = [7, 1]
@@ -865,11 +1026,12 @@ def main():
         root = Path(directory)
         root.chmod(0o711)
         checks = [
+            ("public-help-interface", test_public_help_interface),
             ("stdlib-only-offline-execution", test_self_contained_without_network_dependencies),
             ("migration-and-retry", test_migration),
             ("large-finite-usage-values", test_large_finite_usage_values),
             ("no-period-layout", test_no_periods),
-            ("post-validation-failure-restore-matrix", test_post_validation_failure_restore_matrix),
+            ("post-backup-failure-restore-matrix", test_post_backup_failure_restore_matrix),
             ("wal-backup", test_wal_backup),
             ("invalid-paths", test_invalid_paths),
             ("default-target-schema", test_default_target_schema),

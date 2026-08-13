@@ -29,8 +29,9 @@ of the following requirements.
 - The command accepts `-p/--path OLD.db` and `-n/--new-db TARGET.db` exactly as
   documented by `--help`.
 - It adds tables that exist in the target schema but not in the old database.
-- Every target table must retain its complete declared primary key, including
-  ordered composite primary keys.
+- Every target table must retain its complete declared table definition,
+  including ordered composite primary keys, UNIQUE constraints, CHECK
+  constraints, and foreign keys.
 - For tables present in both databases, the final column set and primary key
   must match the target schema. Values in columns shared by both schemas must
   be preserved.
@@ -78,8 +79,11 @@ schema upgrade without inventing usage values.
   silently reusing it.
 - The backup must be a valid standalone SQLite database. Do not rely on an
   uncheckpointed WAL file beside it.
-- If migration fails for any reason after the input paths are validated, exit
-  non-zero and leave `OLD.db` byte-for-byte equal to `OLD.db.backup`.
+- If a migration operation fails after the fresh backup has been published —
+  while reading the target schema, rebuilding or copying tables, migrating
+  usage, initializing required configuration, or running final integrity and
+  foreign-key checks — exit non-zero and leave `OLD.db` byte-for-byte equal to
+  `OLD.db.backup`.
 - A failed migration must not advance `PRAGMA user_version` or leave temporary
   tables in the restored database.
 - Missing source or target databases, and either input path being a directory or
