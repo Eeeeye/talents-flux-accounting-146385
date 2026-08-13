@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import ast
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import signal
 import sqlite3
@@ -17,6 +19,23 @@ import tempfile
 TARGET_VERSION = 37
 CANDIDATE_UID = 1000
 CANDIDATE_GID = 1000
+NETWORK_IMPORTS = {
+    "ftplib",
+    "http",
+    "imaplib",
+    "poplib",
+    "requests",
+    "smtplib",
+    "socket",
+    "telnetlib",
+    "urllib",
+    "xmlrpc",
+}
+NETWORK_SHELL = re.compile(
+    r"(?:^|[;&|]\s*|\bexec\s+)(?:curl|wget|nc|ncat|ssh|scp|ftp|telnet|pip)\b"
+    r"|\bpython(?:3)?\s+-m\s+pip\b",
+    re.MULTILINE,
+)
 
 
 def terminate_candidate_processes():
@@ -134,6 +153,68 @@ def primary_key(conn, table):
     ]
 
 
+def user_tables(conn):
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+
+def capture_shared_rows(old_conn, target_conn, *, excluded=()):
+    snapshots = []
+    excluded = set(excluded)
+    for table in sorted(user_tables(old_conn) & user_tables(target_conn) - excluded):
+        old_names = {row[1] for row in table_info(old_conn, table)}
+        columns = [
+            row[1] for row in table_info(target_conn, table) if row[1] in old_names
+        ]
+        if not columns:
+            continue
+        projection = ", ".join(quote(column) for column in columns)
+        rows = old_conn.execute(
+            f"SELECT {projection} FROM {quote(table)}"
+        ).fetchall()
+        snapshots.append((table, columns, sorted(rows, key=repr)))
+    return snapshots
+
+
+def assert_preserved_rows(conn, snapshots):
+    for table, columns, expected_rows in snapshots:
+        projection = ", ".join(quote(column) for column in columns)
+        observed_rows = conn.execute(
+            f"SELECT {projection} FROM {quote(table)}"
+        ).fetchall()
+        assert sorted(observed_rows, key=repr) == expected_rows, table
+
+
+def assert_standard_library_only(workspace):
+    for path in sorted((workspace / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".", 1)[0])
+        external = {
+            name
+            for name in imported
+            if name != "fluxacct" and name not in sys.stdlib_module_names
+        }
+        assert not external, f"non-standard dependency in {path}: {sorted(external)}"
+        assert not imported & NETWORK_IMPORTS, (
+            f"network dependency in {path}: {sorted(imported & NETWORK_IMPORTS)}"
+        )
+    for path in sorted((workspace / "bin").iterdir()):
+        if path.is_file():
+            assert not NETWORK_SHELL.search(path.read_text()), (
+                f"network command in public executable: {path}"
+            )
+
+
 def create_target(path):
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -214,6 +295,19 @@ def create_target(path):
             value TEXT NOT NULL,
             PRIMARY KEY (cluster, generation)
         );
+        CREATE TABLE site_fairshare_policy (
+            bank TEXT NOT NULL,
+            period INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            allocation REAL DEFAULT 0.0 NOT NULL,
+            PRIMARY KEY (username, bank, period)
+        );
+        CREATE TABLE "target schema marker" (
+            generation INTEGER NOT NULL,
+            cluster TEXT NOT NULL,
+            note TEXT DEFAULT '' NOT NULL,
+            PRIMARY KEY (cluster, generation)
+        );
         """
     )
     conn.close()
@@ -290,6 +384,18 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
             requested_duration REAL DEFAULT 0.0,
             actual_duration REAL DEFAULT 0.0
         );
+        CREATE TABLE site_fairshare_policy (
+            bank TEXT NOT NULL,
+            period INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            allocation REAL DEFAULT 0.0 NOT NULL,
+            retired TEXT DEFAULT 'legacy' NOT NULL,
+            PRIMARY KEY (bank, period, username)
+        );
+        CREATE TABLE site_local_metadata (
+            setting TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        );
         """
     )
     conn.execute("INSERT INTO bank_table (bank, parent_bank, shares) VALUES ('root', '', 1)")
@@ -297,6 +403,14 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
     conn.execute("INSERT INTO project_table (project) VALUES ('*')")
     conn.execute("INSERT INTO queue_table (queue, priority, obsolete) VALUES ('batch', 3, 77)")
     conn.execute("INSERT INTO t_half_life_period_table VALUES ('cluster', 4102444800)")
+    conn.execute(
+        "INSERT INTO site_fairshare_policy VALUES "
+        "('science', 4, 'alice', 13.5, 'preserve-shared-columns')"
+    )
+    conn.execute(
+        "INSERT INTO site_local_metadata VALUES "
+        "('scheduler-owner', 'site-extension-must-survive')"
+    )
     for factor, weight in (("fairshare", 100000), ("queue", 10000), ("bank", 0), ("urgency", 1000)):
         conn.execute("INSERT INTO priority_factor_weight_table VALUES (?, ?)", (factor, weight))
     for key, value in (
@@ -363,34 +477,31 @@ def assert_database_matches_target(path, target, expected, preserved=None):
     target_conn = sqlite3.connect(target)
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_VERSION
-    for table in (
-        "association_table",
-        "job_usage_factor_table",
-        "job_usage_per_association_table",
-        "queue_table",
-    ):
+    expected_tables = user_tables(target_conn)
+    observed_tables = user_tables(conn)
+    assert expected_tables <= observed_tables, expected_tables - observed_tables
+    for table in sorted(expected_tables):
         assert [row[1:6] for row in table_info(conn, table)] == [
             row[1:6] for row in table_info(target_conn, table)
         ], table
         assert primary_key(conn, table) == primary_key(target_conn, table), table
-    assert "migration_marker" in {
-        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
-    assert [row[1:6] for row in table_info(conn, "migration_marker")] == [
-        row[1:6] for row in table_info(target_conn, "migration_marker")
-    ]
     assert primary_key(conn, "migration_marker") == ["cluster", "generation"]
+    assert primary_key(conn, "site_fairshare_policy") == [
+        "username",
+        "bank",
+        "period",
+    ]
+    assert primary_key(conn, "target schema marker") == ["cluster", "generation"]
     observed = usage_rows(conn)
     assert observed.keys() == expected.keys(), (observed, expected)
     for key, value in expected.items():
         assert math.isclose(observed[key], value, rel_tol=0, abs_tol=1e-12), key
     assert conn.execute("SELECT priority FROM queue_table WHERE queue='batch'").fetchone()[0] == 3
     if preserved is not None:
-        for table, order_by, rows in preserved:
-            observed_rows = conn.execute(
-                f"SELECT * FROM {quote(table)} ORDER BY {order_by}"
-            ).fetchall()
-            assert observed_rows == rows, table
+        assert_preserved_rows(conn, preserved)
+    assert conn.execute(
+        "SELECT setting, value FROM site_local_metadata"
+    ).fetchall() == [("scheduler-owner", "site-extension-must-survive")]
     expected_associations = len({(key[0], key[2]) for key in expected})
     if expected_associations:
         assert conn.execute("SELECT COUNT(*) FROM association_table").fetchone()[0] == expected_associations
@@ -420,18 +531,11 @@ def test_migration(workspace, tmp):
     ]
     expected = create_legacy(old, periods, associations, partial=partial)
     conn = sqlite3.connect(old)
-    preserved = []
-    for table, order_by in (
-        ("bank_table", "bank_id"),
-        ("config_table", "key"),
-        ("priority_factor_weight_table", "factor"),
-        ("project_table", "project_id"),
-        ("t_half_life_period_table", "cluster"),
-        ("jobs", "id"),
-    ):
-        preserved.append(
-            (table, order_by, conn.execute(f"SELECT * FROM {quote(table)} ORDER BY {order_by}").fetchall())
-        )
+    target_conn = sqlite3.connect(target)
+    preserved = capture_shared_rows(
+        conn, target_conn, excluded={"job_usage_per_association_table"}
+    )
+    target_conn.close()
     conn.close()
     handoff(old)
     before_first = sha256(old)
@@ -455,13 +559,29 @@ def test_migration(workspace, tmp):
     conn.commit()
     conn.close()
     update = run([workspace / "bin/flux-account-update-usage", "-p", old])
-    payload = json.loads(update.stdout)
-    assert {(row["username"], row["bank"]) for row in payload["associations"]} == {
+    payload = json.loads(
+        update.stdout,
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"non-finite JSON number: {value}")
+        ),
+    )
+    assert set(payload) == {"database", "associations"}
+    assert payload["database"] == str(old)
+    assert isinstance(payload["associations"], list)
+    for row in payload["associations"]:
+        assert set(row) == {"username", "bank", "job_usage"}
+        assert isinstance(row["username"], str) and isinstance(row["bank"], str)
+        assert isinstance(row["job_usage"], (int, float))
+        assert math.isfinite(row["job_usage"])
+    expected_associations = {
         ("alice", "science"),
         ("alice", "root"),
         ("bob", "science"),
         ("carol", "root"),
     }
+    assert {(row["username"], row["bank"]) for row in payload["associations"]} == (
+        expected_associations
+    )
     conn = sqlite3.connect(old)
     row_count = conn.execute(
         "SELECT COUNT(*) FROM job_usage_per_association_table"
@@ -472,6 +592,35 @@ def test_migration(workspace, tmp):
     assert conn.execute(
         "SELECT COUNT(*) FROM job_usage_per_association_table"
     ).fetchone()[0] == row_count
+    conn.close()
+
+
+def test_large_finite_usage_values(workspace, tmp):
+    target = tmp / "large target schema.db"
+    old = make_source_directory(tmp) / "large finite usage.db"
+    create_target(target)
+    periods = [31, 0, 12]
+    values = {
+        31: 8.988465674311579e307,
+        0: -7.654321098765432e307,
+        12: 1.234567890123456e250,
+    }
+    expected = create_legacy(
+        old, periods, [("magnitude", 9223372036854770000, "science", values)]
+    )
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    assert_database_matches_target(old, target, expected)
+    conn = sqlite3.connect(old)
+    observed = usage_rows(conn)
+    for key, value in expected.items():
+        assert math.isfinite(observed[key])
+        assert observed[key] == value
+        assert conn.execute(
+            "SELECT typeof(value) FROM job_usage_per_association_table "
+            "WHERE username=? AND bank=? AND period=?",
+            (key[0], key[2], key[3]),
+        ).fetchone()[0] in {"integer", "real"}
     conn.close()
 
 
@@ -490,34 +639,21 @@ def test_no_periods(workspace, tmp):
     conn.close()
 
 
-def test_failure_restore(workspace, tmp):
-    target = tmp / "bad target.db"
-    old = make_source_directory(tmp) / "failure source.db"
-    create_target(target)
-    create_legacy(
-        old,
-        [0, 1],
-        [("alice", 1001, "science", {0: 2.5, 1: 7.5})],
-    )
-    stale = Path(str(old) + ".backup")
-    stale.write_bytes(b"stale-backup")
-    target_conn = sqlite3.connect(target)
-    target_conn.execute("DROP TABLE queue_table")
-    target_conn.execute(
-        "CREATE TABLE queue_table (queue TEXT PRIMARY KEY NOT NULL, "
-        "required_new_value TEXT NOT NULL)"
-    )
-    target_conn.commit()
-    target_conn.close()
+def assert_post_validation_failure_restored(workspace, old, target, *, stale=False):
+    backup = Path(str(old) + ".backup")
+    if stale:
+        backup.write_bytes(b"stale-backup")
+        handoff(backup)
+    before = sha256(old)
     handoff(old)
-    handoff(stale)
     result = run(
         [workspace / "bin/flux-account-update-db", "-p", old, "-n", target],
         expect=None,
     )
     assert result.returncode != 0
-    assert old.is_file() and stale.is_file()
-    assert sha256(old) == sha256(stale)
+    assert old.is_file() and backup.is_file()
+    assert sha256(backup) == before
+    assert sha256(old) == sha256(backup)
     conn = sqlite3.connect(old)
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 31
@@ -525,6 +661,57 @@ def test_failure_restore(workspace, tmp):
         "SELECT 1 FROM sqlite_master WHERE name LIKE '%_tmp' LIMIT 1"
     ).fetchone()
     conn.close()
+
+
+def test_post_validation_failure_restore_matrix(workspace, tmp):
+    cases = []
+
+    constraint_target = tmp / "constraint target.db"
+    constraint_old = make_source_directory(tmp, "constraint-source") / "old.db"
+    create_target(constraint_target)
+    create_legacy(
+        constraint_old,
+        [0, 1],
+        [("alice", 1001, "science", {0: 2.5, 1: 7.5})],
+    )
+    target_conn = sqlite3.connect(constraint_target)
+    target_conn.execute("DROP TABLE queue_table")
+    target_conn.execute(
+        "CREATE TABLE queue_table (queue TEXT PRIMARY KEY NOT NULL, "
+        "required_new_value TEXT NOT NULL)"
+    )
+    target_conn.commit()
+    target_conn.close()
+    cases.append((constraint_old, constraint_target, True))
+
+    missing_table_target = tmp / "missing destination target.db"
+    missing_table_old = make_source_directory(tmp, "missing-table-source") / "old.db"
+    create_target(missing_table_target)
+    create_legacy(
+        missing_table_old,
+        [4],
+        [("bob", 1002, "root", {4: 19.5})],
+    )
+    target_conn = sqlite3.connect(missing_table_target)
+    target_conn.execute("DROP TABLE job_usage_per_association_table")
+    target_conn.commit()
+    target_conn.close()
+    cases.append((missing_table_old, missing_table_target, False))
+
+    corrupt_target = tmp / "corrupt target.db"
+    corrupt_target.write_bytes(b"not a sqlite database")
+    corrupt_old = make_source_directory(tmp, "corrupt-target-source") / "old.db"
+    create_legacy(
+        corrupt_old,
+        [8],
+        [("carol", 1003, "science", {8: -11.25})],
+    )
+    cases.append((corrupt_old, corrupt_target, False))
+
+    for old, target, stale in cases:
+        assert_post_validation_failure_restored(
+            workspace, old, target, stale=stale
+        )
 
 
 def test_wal_backup(workspace, tmp):
@@ -588,6 +775,8 @@ def test_invalid_paths(workspace, tmp):
         expect=None,
     )
     assert result.returncode != 0
+    backup = Path(str(old) + ".backup")
+    assert not backup.exists()
     target_directory = tmp / "target-directory.db"
     target_directory.mkdir()
     before_invalid_target = sha256(old)
@@ -597,6 +786,7 @@ def test_invalid_paths(workspace, tmp):
     )
     assert result.returncode != 0
     assert sha256(old) == before_invalid_target
+    assert not backup.exists()
     target_symlink = tmp / "target-link.db"
     target_symlink.symlink_to(target)
     result = run(
@@ -605,6 +795,7 @@ def test_invalid_paths(workspace, tmp):
     )
     assert result.returncode != 0
     assert sha256(old) == before_invalid_target
+    assert not backup.exists()
     symlink = source / "linked.db"
     symlink.symlink_to(old)
     result = run(
@@ -612,6 +803,32 @@ def test_invalid_paths(workspace, tmp):
         expect=None,
     )
     assert result.returncode != 0
+    assert not Path(str(symlink) + ".backup").exists()
+
+
+def test_self_contained_without_network_dependencies(workspace, tmp):
+    assert_standard_library_only(workspace)
+    target = tmp / "offline target.db"
+    old = make_source_directory(tmp) / "offline source.db"
+    create_target(target)
+    expected = create_legacy(
+        old,
+        [6, 0],
+        [("offline", 5001, "science", {6: 42.25, 0: -0.5})],
+    )
+    handoff(old)
+    offline_env = {
+        "ALL_PROXY": "http://127.0.0.1:9",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "NO_PROXY": "",
+        "PIP_NO_INDEX": "1",
+    }
+    run(
+        [workspace / "bin/flux-account-update-db", "-p", old, "-n", target],
+        env=offline_env,
+    )
+    assert_database_matches_target(old, target, expected)
 
 
 def test_default_target_schema(workspace, tmp):
@@ -648,9 +865,11 @@ def main():
         root = Path(directory)
         root.chmod(0o711)
         checks = [
+            ("stdlib-only-offline-execution", test_self_contained_without_network_dependencies),
             ("migration-and-retry", test_migration),
+            ("large-finite-usage-values", test_large_finite_usage_values),
             ("no-period-layout", test_no_periods),
-            ("failure-restore", test_failure_restore),
+            ("post-validation-failure-restore-matrix", test_post_validation_failure_restore_matrix),
             ("wal-backup", test_wal_backup),
             ("invalid-paths", test_invalid_paths),
             ("default-target-schema", test_default_target_schema),

@@ -95,8 +95,23 @@ uniqueness errors:
 ./bin/flux-account-update-usage -p OLD.db
 ```
 
-Its JSON result must include every association, and repeated usage updates
-must not create duplicate period rows.
+It must write one JSON object to standard output with exactly these top-level
+members:
+
+```json
+{
+  "database": "OLD.db",
+  "associations": [
+    {"username": "alice", "bank": "science", "job_usage": 12.5}
+  ]
+}
+```
+
+`database` is the path argument as supplied. `associations` is an array with
+one object for every association; each object has exactly the string members
+`username` and `bank` plus the finite numeric member `job_usage`. The array
+order is not significant. Repeated usage updates must not create duplicate
+period rows.
 
 ## Preserved interfaces
 
