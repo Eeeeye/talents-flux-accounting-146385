@@ -37,8 +37,9 @@ of the following requirements.
   whitespace. Column and constraint order therefore matter; only whitespace
   formatting and the spelling/quoting of the table name before `(` are ignored.
 - For tables present in both databases, the final column set and primary key
-  must match the target schema. Values in columns shared by both schemas must
-  be preserved.
+  must exactly match the target schema. A source column absent from that target
+  table is removed as part of the schema change; values in columns shared by
+  both schemas must be preserved.
 - A target-only column receives the behavior declared by the target table: an
   omitted column uses its declared DEFAULT or NULL where SQLite permits it. If
   existing rows cannot satisfy a target-only column (for example, it is NOT
@@ -59,9 +60,10 @@ or an out-of-range suffix are not legacy period columns. The columns may appear
 in any physical column order and the sequence of `N` values need not be
 contiguous. The destination `period` is that suffix interpreted as an integer.
 
-For every legacy association `(username, userid, bank)` and every legacy
-period column, the upgraded `job_usage_per_association_table` must contain the
-row:
+The legacy table's declared primary key guarantees at most one source row for
+each `(username, bank)`. For every legacy association
+`(username, userid, bank)` and every legacy period column, the upgraded
+`job_usage_per_association_table` must contain the row:
 
 ```text
 (username, userid, bank, period=N, value=legacy_column_value)

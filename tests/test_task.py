@@ -3,6 +3,7 @@ import argparse
 import ast
 import base64
 import ctypes
+import decimal
 import errno
 import hashlib
 import json
@@ -12,7 +13,6 @@ from pathlib import Path
 import platform
 import random
 import re
-import secrets
 import shutil
 import signal
 import sqlite3
@@ -24,6 +24,10 @@ import tempfile
 TARGET_VERSION = 37
 CANDIDATE_UID = 1000
 CANDIDATE_GID = 1000
+DEFAULT_VERIFIER_SEED = "flux-safe-migration-r8-v1"
+VERIFIER_SEED_ENV = "FLUX_ACCOUNTING_VERIFIER_SEED"
+VERIFIER_SEED = os.environ.get(VERIFIER_SEED_ENV, DEFAULT_VERIFIER_SEED)
+PRE_MIGRATION_TABLES = {}
 NETWORK_IMPORTS = {
     "ftplib",
     "http",
@@ -297,6 +301,16 @@ def quote(identifier):
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def seeded_random(label):
+    material = f"{VERIFIER_SEED}\0{label}".encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(material).digest(), "big")
+    return random.Random(seed)
+
+
+def random_hex(randomizer, byte_count):
+    return f"{randomizer.getrandbits(byte_count * 8):0{byte_count * 2}x}"
+
+
 def table_info(conn, table):
     return conn.execute(f"PRAGMA table_info({quote(table)})").fetchall()
 
@@ -332,6 +346,40 @@ def explicit_indexes(conn, table):
         )
         indexes.append((unique, origin, partial, columns))
     return sorted(indexes, key=repr)
+
+
+def schema_objects(conn, table):
+    return conn.execute(
+        "SELECT type, sql FROM sqlite_master "
+        "WHERE tbl_name=? AND type IN ('table', 'index', 'trigger') "
+        "AND sql IS NOT NULL ORDER BY type, name",
+        (table,),
+    ).fetchall()
+
+
+def table_rows(conn, table):
+    rows = conn.execute(f"SELECT * FROM {quote(table)}").fetchall()
+    return sorted(rows, key=repr)
+
+
+def snapshot_table(conn, table):
+    return {
+        "objects": schema_objects(conn, table),
+        "table_info": table_info(conn, table),
+        "primary_key": primary_key(conn, table),
+        "indexes": explicit_indexes(conn, table),
+        "foreign_keys": conn.execute(
+            f"PRAGMA foreign_key_list({quote(table)})"
+        ).fetchall(),
+        "rows": table_rows(conn, table),
+    }
+
+
+def assert_source_only_tables_preserved(conn, snapshots):
+    observed_tables = user_tables(conn)
+    assert snapshots.keys() <= observed_tables, snapshots.keys() - observed_tables
+    for table, expected in snapshots.items():
+        assert snapshot_table(conn, table) == expected, table
 
 
 def user_tables(conn):
@@ -436,6 +484,8 @@ def assert_standard_library_only(workspace):
 def assert_no_verifier_fixture_fingerprints(workspace):
     known_fragments = (
         "4815162342",
+        "flux-safe-migration-r8-v1",
+        "old_only_marker_",
         "period-boundary",
         "default-user",
         "scheduler-owner",
@@ -670,6 +720,12 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
     )
     conn.execute("INSERT INTO bank_table (bank, parent_bank, shares) VALUES ('root', '', 1)")
     conn.execute("INSERT INTO bank_table (bank, parent_bank, shares) VALUES ('science', 'root', 1)")
+    for bank in sorted({row[2] for row in associations} - {"root", "science"}):
+        conn.execute(
+            "INSERT INTO bank_table (bank, parent_bank, shares) "
+            "VALUES (?, 'root', 1)",
+            (bank,),
+        )
     conn.execute("INSERT INTO project_table (project) VALUES ('*')")
     conn.execute("INSERT INTO queue_table (queue, priority, obsolete) VALUES ('batch', 3, 77)")
     conn.execute("INSERT INTO t_half_life_period_table VALUES ('cluster', 4102444800)")
@@ -730,8 +786,69 @@ def create_legacy(path, periods, associations, *, partial=None, no_periods=False
                 "INSERT INTO job_usage_per_association_table VALUES (?, ?, ?, ?, ?)", row
             )
     conn.commit()
+    remember_pre_migration_tables(path, conn)
     conn.close()
     return expected
+
+
+def remember_pre_migration_tables(path, conn):
+    PRE_MIGRATION_TABLES[str(Path(path).resolve())] = {
+        table: snapshot_table(conn, table) for table in user_tables(conn)
+    }
+
+
+def add_source_only_tables(conn, randomizer, hidden):
+    parent = f"legacy ownership {hidden} {random_hex(randomizer, 3)}"
+    child = f"allocation_ext_{random_hex(randomizer, 6)}"
+    audit = f"ops_audit_{random_hex(randomizer, 7)}"
+    child_index = f"idx_{hidden}_{random_hex(randomizer, 4)}"
+    child_trigger = f"trg_{hidden}_{random_hex(randomizer, 4)}"
+    conn.execute(
+        f"CREATE TABLE {quote(parent)} ("
+        "tenant TEXT NOT NULL, generation INTEGER NOT NULL, label TEXT NOT NULL, "
+        "PRIMARY KEY (generation, tenant), UNIQUE (tenant, label), "
+        "CHECK (generation >= 0))"
+    )
+    conn.execute(
+        f"CREATE TABLE {quote(audit)} ("
+        "event_id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, generation INTEGER NOT NULL, "
+        "payload TEXT NOT NULL)"
+    )
+    conn.execute(
+        f"CREATE TABLE {quote(child)} ("
+        "sequence INTEGER NOT NULL, tenant TEXT NOT NULL, generation INTEGER NOT NULL, "
+        "amount REAL NOT NULL, note TEXT DEFAULT '' NOT NULL, "
+        "PRIMARY KEY (tenant, sequence, generation), "
+        "UNIQUE (sequence, tenant, generation), CHECK (amount >= 0), "
+        f"FOREIGN KEY (generation, tenant) REFERENCES {quote(parent)} "
+        "(generation, tenant))"
+    )
+    conn.execute(
+        f"CREATE INDEX {quote(child_index)} ON {quote(child)} "
+        "(generation DESC, amount, tenant) WHERE amount > 0"
+    )
+    conn.execute(
+        f"CREATE TRIGGER {quote(child_trigger)} AFTER UPDATE OF amount "
+        f"ON {quote(child)} BEGIN INSERT INTO {quote(audit)} "
+        "(tenant, generation, payload) VALUES "
+        "(NEW.tenant, NEW.generation, NEW.note); END"
+    )
+    parent_rows = [
+        (f"tenant-{hidden}-a", 7, f"alpha-{random_hex(randomizer, 4)}"),
+        (f"tenant-{hidden}-b", 11, f"beta-{random_hex(randomizer, 4)}"),
+    ]
+    child_rows = [
+        (3, parent_rows[0][0], parent_rows[0][1], 1.25, "first"),
+        (8, parent_rows[0][0], parent_rows[0][1], 9.5, "second"),
+        (2, parent_rows[1][0], parent_rows[1][1], 0.0, "zero"),
+    ]
+    conn.executemany(
+        f"INSERT INTO {quote(parent)} VALUES (?, ?, ?)", parent_rows
+    )
+    conn.executemany(
+        f"INSERT INTO {quote(child)} VALUES (?, ?, ?, ?, ?)", child_rows
+    )
+    return {"parent": parent, "child": child, "audit": audit}
 
 
 def usage_rows(conn):
@@ -763,6 +880,14 @@ def assert_database_matches_target(path, target, expected, preserved=None):
     expected_tables = user_tables(target_conn)
     observed_tables = user_tables(conn)
     assert expected_tables <= observed_tables, expected_tables - observed_tables
+    source_snapshots = {
+        table: snapshot
+        for table, snapshot in PRE_MIGRATION_TABLES.get(
+            str(Path(path).resolve()), {}
+        ).items()
+        if table not in expected_tables
+    }
+    assert_source_only_tables_preserved(conn, source_snapshots)
     for table in sorted(expected_tables):
         assert [row[1:6] for row in table_info(conn, table)] == [
             row[1:6] for row in table_info(target_conn, table)
@@ -810,6 +935,14 @@ def assert_schema_matches_target(path, target):
     expected_tables = user_tables(target_conn)
     observed_tables = user_tables(conn)
     assert expected_tables <= observed_tables, expected_tables - observed_tables
+    source_snapshots = {
+        table: snapshot
+        for table, snapshot in PRE_MIGRATION_TABLES.get(
+            str(Path(path).resolve()), {}
+        ).items()
+        if table not in expected_tables
+    }
+    assert_source_only_tables_preserved(conn, source_snapshots)
     for table in sorted(expected_tables):
         assert [row[1:6] for row in table_info(conn, table)] == [
             row[1:6] for row in table_info(target_conn, table)
@@ -879,12 +1012,12 @@ def assert_target_constraints_enforced(path, association=None):
     conn.close()
 
 
-def test_migration(workspace, tmp, *, run_usage=True):
+def test_migration(workspace, tmp, *, run_usage=True, case_label="primary"):
     target = tmp / "target schema.db"
     old = make_source_directory(tmp) / "old accounting data.db"
     create_target(target)
-    randomizer = random.SystemRandom()
-    hidden = secrets.token_hex(6)
+    randomizer = seeded_random(f"migration:{case_label}")
+    hidden = random_hex(randomizer, 6)
     hidden_target_table = f"site_target_{hidden}"
     target_conn = sqlite3.connect(target)
     target_conn.execute(
@@ -929,12 +1062,24 @@ def test_migration(workspace, tmp, *, run_usage=True):
         f"CREATE TABLE {quote(hidden_source_table)} ("
         "setting TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
     )
-    hidden_source_row = (f"setting-{hidden}", f"value-{secrets.token_hex(7)}")
+    hidden_source_row = (f"setting-{hidden}", f"value-{random_hex(randomizer, 7)}")
     conn.execute(
         f"INSERT INTO {quote(hidden_source_table)} VALUES (?, ?)",
         hidden_source_row,
     )
+    complex_source_tables = add_source_only_tables(conn, randomizer, hidden)
+    marker_table = f"old_only_marker_{random_hex(randomizer, 5)}"
+    marker_value = f"marker-{random_hex(randomizer, 8)}"
+    conn.execute(
+        f"CREATE TABLE {quote(marker_table)} ("
+        "marker TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    conn.execute(
+        f"INSERT INTO {quote(marker_table)} VALUES (?, ?)",
+        ("preserve", marker_value),
+    )
     conn.commit()
+    remember_pre_migration_tables(old, conn)
     conn.close()
     conn = sqlite3.connect(old)
     target_conn = sqlite3.connect(target)
@@ -964,24 +1109,55 @@ def test_migration(workspace, tmp, *, run_usage=True):
     assert_database_matches_target(old, target, expected, preserved)
     assert usage_rows(sqlite3.connect(old)) == first_rows
     if run_usage:
+        historical_before = {
+            (username, bank): {
+                period: expected_sqlite_numeric(value)[0]
+                for period, value in values.items()
+            }
+            for username, _, bank, values in associations
+        }
+        weights = ("1.25", "0.5", "0.0")
+        jobs_by_association = {
+            (identities[0][0], identities[0][2]): [
+                ("0,1,2", 137.25),
+                ("0", 12.5),
+            ],
+            (identities[1][0], identities[1][2]): [
+                ("0,1", 43.75),
+            ],
+        }
         conn = sqlite3.connect(old)
-        conn.execute(
-            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        conn.executemany(
+            "UPDATE config_table SET value=? WHERE key=?",
             (
-                f"job-{hidden}",
-                identities[0][1],
-                5900,
-                6000,
-                6200,
-                "0,1",
-                "{}",
-                "{}",
-                "*",
-                identities[0][2],
-                200,
-                200,
+                (str(weights[0]), "node_weight"),
+                (str(weights[1]), "core_weight"),
+                (str(weights[2]), "gpu_weight"),
             ),
         )
+        job_index = 0
+        for username, userid, bank in identities:
+            for ranks, actual_duration in jobs_by_association.get(
+                (username, bank), ()
+            ):
+                job_index += 1
+                conn.execute(
+                    "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"job-{hidden}-{job_index}",
+                        userid,
+                        5800 + job_index,
+                        5900 + job_index,
+                        6100 + job_index,
+                        ranks,
+                        "{}",
+                        "{}",
+                        "*",
+                        bank,
+                        actual_duration,
+                        actual_duration,
+                    ),
+                )
         conn.commit()
         conn.close()
         update = run([workspace / "bin/flux-account-update-usage", "-p", old])
@@ -1004,23 +1180,178 @@ def test_migration(workspace, tmp, *, run_usage=True):
             expected_associations
         )
         conn = sqlite3.connect(old)
+        assert_downstream_usage(
+            conn,
+            payload,
+            identities,
+            historical_before,
+            jobs_by_association,
+            weights,
+        )
         row_count = conn.execute(
             "SELECT COUNT(*) FROM job_usage_per_association_table"
         ).fetchone()[0]
         conn.close()
-        run([workspace / "bin/flux-account-update-usage", "-p", old])
+        second_update = run(
+            [workspace / "bin/flux-account-update-usage", "-p", old]
+        )
+        second_payload = json.loads(second_update.stdout)
         conn = sqlite3.connect(old)
         assert conn.execute(
             "SELECT COUNT(*) FROM job_usage_per_association_table"
         ).fetchone()[0] == row_count
+        second_json = {
+            (row["username"], row["bank"]): row["job_usage"]
+            for row in second_payload["associations"]
+        }
+        second_db = {
+            (username, bank): job_usage
+            for username, bank, job_usage in conn.execute(
+                "SELECT username, bank, job_usage FROM association_table"
+            )
+        }
+        assert second_json == second_db
+        assert second_json.keys() == expected_associations
+        assert all(math.isfinite(value) for value in second_json.values())
         conn.close()
+    elif case_label == "randomized-0":
+        conn = sqlite3.connect(old)
+        assert conn.execute(
+            f"SELECT value FROM {quote(marker_table)} WHERE marker='preserve'"
+        ).fetchone() == (marker_value,)
+        assert set(complex_source_tables.values()) <= user_tables(conn)
+        conn.close()
+
+
+def expected_current_period_job_usage(jobs, weights):
+    node_weight, core_weight, gpu_weight = map(decimal.Decimal, weights)
+    total = decimal.Decimal(0)
+    for ranks, actual_duration in jobs:
+        nodes = max(1, len([rank for rank in ranks.split(",") if rank]))
+        cores = nodes
+        gpus = 0
+        weighted = (
+            nodes * node_weight
+            + cores * core_weight
+            + gpus * gpu_weight
+        ) * decimal.Decimal(str(actual_duration))
+        rounded = weighted.quantize(decimal.Decimal("0.00001"))
+        total += rounded
+    return float(total)
+
+
+def assert_downstream_usage(
+    conn, payload, identities, historical_before, jobs_by_association, weights
+):
+    expected = {}
+    for username, userid, bank in identities:
+        key = (username, bank)
+        current = expected_current_period_job_usage(
+            jobs_by_association.get(key, ()), weights
+        )
+        periods = historical_before[(username, bank)]
+        expected[key] = current + sum(periods.values())
+
+    actual_json = {
+        (row["username"], row["bank"]): row["job_usage"]
+        for row in payload["associations"]
+    }
+    actual_db = {
+        (username, bank): job_usage
+        for username, bank, job_usage in conn.execute(
+            "SELECT username, bank, job_usage FROM association_table"
+        )
+    }
+    period_zero = {
+        (username, bank): value
+        for username, bank, value in conn.execute(
+            "SELECT username, bank, value "
+            "FROM job_usage_per_association_table WHERE period=0"
+        )
+    }
+    assert actual_json.keys() == expected.keys()
+    assert actual_db.keys() == expected.keys()
+    for key, expected_value in expected.items():
+        assert math.isclose(
+            actual_json[key], expected_value, rel_tol=1e-12, abs_tol=1e-12
+        ), (key, actual_json[key], expected_value)
+        assert math.isclose(
+            actual_db[key], expected_value, rel_tol=1e-12, abs_tol=1e-12
+        ), (key, actual_db[key], expected_value)
+        expected_current = historical_before[key].get(0, 0.0)
+        expected_current += expected_current_period_job_usage(
+            jobs_by_association.get(key, ()), weights
+        )
+        assert math.isclose(
+            period_zero[key], expected_current, rel_tol=1e-12, abs_tol=1e-12
+        ), (key, period_zero[key], expected_current)
 
 
 def test_hidden_randomized_migrations(workspace, tmp):
     for index in range(3):
         case = tmp / f"randomized-{index}"
         case.mkdir()
-        test_migration(workspace, case, run_usage=False)
+        test_migration(
+            workspace, case, run_usage=False, case_label=f"randomized-{index}"
+        )
+
+
+def test_downstream_usage_decay(workspace, tmp):
+    target = tmp / "decay target.db"
+    old = make_source_directory(tmp) / "decay source.db"
+    create_target(target)
+    randomizer = seeded_random("downstream-usage-decay")
+    username = f"decay-{random_hex(randomizer, 6)}"
+    userid = randomizer.randrange(10000, 90000)
+    values = {0: 120.0, 1: 48.0, 2: 16.0}
+    create_legacy(
+        old,
+        [2, 0, 1],
+        [(username, userid, "science", values)],
+    )
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    conn = sqlite3.connect(old)
+    conn.execute(
+        "UPDATE config_table SET value='0.25' WHERE key='decay_factor'"
+    )
+    conn.execute(
+        "UPDATE t_half_life_period_table "
+        "SET end_half_life_period=1 WHERE cluster='cluster'"
+    )
+    conn.commit()
+    conn.close()
+
+    update = run([workspace / "bin/flux-account-update-usage", "-p", old])
+    payload = json.loads(update.stdout)
+    assert payload["database"] == str(old)
+    assert len(payload["associations"]) == 1
+    row = payload["associations"][0]
+    assert (row["username"], row["bank"]) == (username, "science")
+    expected_periods = {0: 0.0, 1: 30.0, 2: 12.0}
+    expected_usage = sum(expected_periods.values())
+    assert math.isclose(
+        row["job_usage"], expected_usage, rel_tol=1e-12, abs_tol=1e-12
+    )
+    conn = sqlite3.connect(old)
+    observed_periods = {
+        period: value
+        for period, value in conn.execute(
+            "SELECT period, value FROM job_usage_per_association_table "
+            "WHERE username=? AND bank=?",
+            (username, "science"),
+        )
+    }
+    assert observed_periods == expected_periods
+    observed_usage = conn.execute(
+        "SELECT job_usage FROM association_table "
+        "WHERE username=? AND bank=?",
+        (username, "science"),
+    ).fetchone()[0]
+    assert math.isclose(
+        observed_usage, expected_usage, rel_tol=1e-12, abs_tol=1e-12
+    )
+    conn.close()
 
 
 def test_large_finite_usage_values(workspace, tmp):
@@ -1302,6 +1633,7 @@ def test_post_backup_failure_restore_matrix(workspace, tmp):
         "UPDATE site_fairshare_policy SET username='missing-parent'"
     )
     old_conn.commit()
+    remember_pre_migration_tables(foreign_key_old, old_conn)
     old_conn.close()
     target_conn = sqlite3.connect(foreign_key_target)
     target_conn.execute("DROP TABLE site_fairshare_policy")
@@ -1339,6 +1671,7 @@ def test_wal_backup(workspace, tmp):
         "WHERE username='waluser' AND bank='science'"
     )
     conn.commit()
+    remember_pre_migration_tables(old, conn)
     expected[("waluser", 3001, "science", 3)] = 77.25
     handoff(old)
     for suffix in ("-wal", "-shm"):
@@ -1518,9 +1851,9 @@ def test_default_target_schema(workspace, tmp):
     trusted_conn.executescript(DEFAULT_TARGET_SCHEMA)
     trusted_conn.close()
     old = make_source_directory(tmp) / "default target source.db"
-    randomizer = random.SystemRandom()
+    randomizer = seeded_random("default-target-schema")
     periods = randomizer.sample(range(20, 500), 3)
-    username = f"default-{secrets.token_hex(5)}"
+    username = f"default-{random_hex(randomizer, 5)}"
     associations = [
         (
             username,
@@ -1563,7 +1896,8 @@ def test_target_only_column_values(workspace, tmp):
     target = tmp / "target-only column schema.db"
     old = make_source_directory(tmp) / "target-only column source.db"
     create_target(target)
-    expected_default = f"target-default-{secrets.token_hex(8)}"
+    randomizer = seeded_random("target-only-column-values")
+    expected_default = f"target-default-{random_hex(randomizer, 8)}"
     target_conn = sqlite3.connect(target)
     target_conn.execute(
         "ALTER TABLE queue_table ADD COLUMN target_only_default TEXT "
@@ -1600,6 +1934,10 @@ def main():
     parser.add_argument("--workspace", type=Path, required=True)
     args = parser.parse_args()
     workspace = args.workspace.resolve()
+    print(
+        f"verifier seed ({VERIFIER_SEED_ENV})="
+        f"{json.dumps(VERIFIER_SEED, ensure_ascii=True)}"
+    )
     assert_standard_library_only(workspace)
     assert_no_verifier_fixture_fingerprints(workspace)
     assert_network_syscalls_blocked()
@@ -1611,6 +1949,7 @@ def main():
             ("stdlib-only-offline-execution", test_self_contained_without_network_dependencies),
             ("migration-and-retry", test_migration),
             ("hidden-randomized-migrations", test_hidden_randomized_migrations),
+            ("downstream-usage-decay", test_downstream_usage_decay),
             ("large-finite-usage-values", test_large_finite_usage_values),
             ("period-name-boundaries", test_period_name_boundaries),
             ("out-of-range-only-period-name", test_out_of_range_only_period_names),

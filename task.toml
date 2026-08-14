@@ -19,7 +19,8 @@ legacy-to-normalized data transformation, partial retries, backup consistency,
 transaction rollback, and downstream usage updates. Local changes that only
 move one function call or add a backup copy leave idempotency, schema fidelity,
 or failure restoration wrong. The verifier uses independent randomized legacy
-schemas and byte-level failure-safety observations.
+schemas generated from a logged replayable seed and byte-level failure-safety
+observations.
 """
 
 [verifier]
