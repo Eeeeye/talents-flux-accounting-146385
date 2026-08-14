@@ -100,6 +100,13 @@ def move_existing_rows(old_cur, cols, old_columns, table):
     old_names = {column[1] for column in old_columns}
     existing = [column[1] for column in cols if column[1] in old_names]
     if not existing:
+        row_count = old_cur.execute(
+            f"SELECT COUNT(*) FROM {quote(table[0])}"
+        ).fetchone()[0]
+        for _ in range(row_count):
+            old_cur.execute(
+                f"INSERT INTO {quote(table[0] + '_tmp')} DEFAULT VALUES"
+            )
         return
     names = ", ".join(quote(name) for name in existing)
     old_cur.execute(

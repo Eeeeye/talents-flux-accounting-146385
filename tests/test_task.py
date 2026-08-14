@@ -3,7 +3,6 @@ import argparse
 import ast
 import base64
 import ctypes
-import decimal
 import errno
 import hashlib
 import json
@@ -24,7 +23,7 @@ import tempfile
 TARGET_VERSION = 37
 CANDIDATE_UID = 1000
 CANDIDATE_GID = 1000
-DEFAULT_VERIFIER_SEED = "flux-safe-migration-r8-v1"
+DEFAULT_VERIFIER_SEED = "flux-safe-migration-r9-v1"
 VERIFIER_SEED_ENV = "FLUX_ACCOUNTING_VERIFIER_SEED"
 VERIFIER_SEED = os.environ.get(VERIFIER_SEED_ENV, DEFAULT_VERIFIER_SEED)
 PRE_MIGRATION_TABLES = {}
@@ -1224,8 +1223,8 @@ def test_migration(workspace, tmp, *, run_usage=True, case_label="primary"):
 
 
 def expected_current_period_job_usage(jobs, weights):
-    node_weight, core_weight, gpu_weight = map(decimal.Decimal, weights)
-    total = decimal.Decimal(0)
+    node_weight, core_weight, gpu_weight = map(float, weights)
+    total = 0.0
     for ranks, actual_duration in jobs:
         nodes = max(1, len([rank for rank in ranks.split(",") if rank]))
         cores = nodes
@@ -1234,10 +1233,9 @@ def expected_current_period_job_usage(jobs, weights):
             nodes * node_weight
             + cores * core_weight
             + gpus * gpu_weight
-        ) * decimal.Decimal(str(actual_duration))
-        rounded = weighted.quantize(decimal.Decimal("0.00001"))
-        total += rounded
-    return float(total)
+        ) * actual_duration
+        total += round(weighted, 5)
+    return total
 
 
 def assert_downstream_usage(
@@ -1354,6 +1352,74 @@ def test_downstream_usage_decay(workspace, tmp):
     conn.close()
 
 
+def test_per_job_rounding(workspace, tmp):
+    target = tmp / "per-job rounding target.db"
+    old = make_source_directory(tmp) / "per-job rounding source.db"
+    create_target(target)
+    randomizer = seeded_random("per-job-rounding")
+    username = f"rounding-{random_hex(randomizer, 6)}"
+    userid = randomizer.randrange(10000, 90000)
+    create_legacy(
+        old,
+        [0],
+        [(username, userid, "science", {0: 0.0})],
+    )
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    conn = sqlite3.connect(old)
+    conn.executemany(
+        "UPDATE config_table SET value=? WHERE key=?",
+        (
+            ("1.0", "node_weight"),
+            ("0.0", "core_weight"),
+            ("0.0", "gpu_weight"),
+        ),
+    )
+    duration = 0.000006
+    for index in range(2):
+        conn.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"round-{index}-{random_hex(randomizer, 4)}",
+                userid,
+                200 + index,
+                210 + index,
+                220 + index,
+                "0",
+                "{}",
+                "{}",
+                "*",
+                "science",
+                duration,
+                duration,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    update = run([workspace / "bin/flux-account-update-usage", "-p", old])
+    payload = json.loads(update.stdout)
+    expected = sum(round(duration, 5) for _ in range(2))
+    assert expected != round(duration * 2, 5)
+    assert len(payload["associations"]) == 1
+    row = payload["associations"][0]
+    assert (row["username"], row["bank"]) == (username, "science")
+    assert math.isclose(row["job_usage"], expected, rel_tol=0.0, abs_tol=1e-15)
+    conn = sqlite3.connect(old)
+    observed = conn.execute(
+        "SELECT a.job_usage, p.value "
+        "FROM association_table a JOIN job_usage_per_association_table p "
+        "ON a.username=p.username AND a.bank=p.bank "
+        "WHERE a.username=? AND a.bank=? AND p.period=0",
+        (username, "science"),
+    ).fetchone()
+    assert all(
+        math.isclose(value, expected, rel_tol=0.0, abs_tol=1e-15)
+        for value in observed
+    )
+    conn.close()
+
+
 def test_large_finite_usage_values(workspace, tmp):
     target = tmp / "large target schema.db"
     old = make_source_directory(tmp) / "large finite usage.db"
@@ -1396,6 +1462,9 @@ def test_period_name_boundaries(workspace, tmp):
     conn = sqlite3.connect(old)
     ignored_columns = (
         "usage_factor_period_01",
+        "usage_factor_period_-1",
+        "usage_factor_period_+1",
+        "usage_factor_period_",
         "Usage_factor_period_7",
         "usage_factor_period_9223372036854775808",
         "usage_factor_period_١",
@@ -1929,6 +1998,53 @@ def test_target_only_column_values(workspace, tmp):
     conn.close()
 
 
+def test_no_common_column_values(workspace, tmp):
+    target = tmp / "no-common target.db"
+    old = make_source_directory(tmp) / "no-common source.db"
+    create_target(target)
+    create_legacy(
+        old,
+        [0],
+        [("no-common", 7201, "science", {0: 2.5})],
+    )
+    randomizer = seeded_random("no-common-column-values")
+    table = f"schema_pivot_{random_hex(randomizer, 8)}"
+    expected_default = f"target-default-{random_hex(randomizer, 8)}"
+    target_conn = sqlite3.connect(target)
+    target_conn.execute(
+        f"CREATE TABLE {quote(table)} ("
+        "target_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        f"target_state TEXT DEFAULT '{expected_default}' NOT NULL, "
+        "target_note TEXT)"
+    )
+    target_conn.commit()
+    target_conn.close()
+    old_conn = sqlite3.connect(old)
+    old_conn.execute(
+        f"CREATE TABLE {quote(table)} ("
+        "legacy_key TEXT PRIMARY KEY NOT NULL, legacy_value INTEGER NOT NULL)"
+    )
+    old_conn.executemany(
+        f"INSERT INTO {quote(table)} VALUES (?, ?)",
+        (("first", 11), ("second", 22)),
+    )
+    old_conn.commit()
+    remember_pre_migration_tables(old, old_conn)
+    old_conn.close()
+    handoff(old)
+    run([workspace / "bin/flux-account-update-db", "-p", old, "-n", target])
+    assert_schema_matches_target(old, target)
+    conn = sqlite3.connect(old)
+    assert conn.execute(
+        f"SELECT target_id, target_state, target_note "
+        f"FROM {quote(table)} ORDER BY target_id"
+    ).fetchall() == [
+        (1, expected_default, None),
+        (2, expected_default, None),
+    ]
+    conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", type=Path, required=True)
@@ -1950,6 +2066,7 @@ def main():
             ("migration-and-retry", test_migration),
             ("hidden-randomized-migrations", test_hidden_randomized_migrations),
             ("downstream-usage-decay", test_downstream_usage_decay),
+            ("per-job-rounding", test_per_job_rounding),
             ("large-finite-usage-values", test_large_finite_usage_values),
             ("period-name-boundaries", test_period_name_boundaries),
             ("out-of-range-only-period-name", test_out_of_range_only_period_names),
@@ -1961,6 +2078,7 @@ def main():
             ("pre-backup-failure-preserves-source", test_pre_backup_failure_preserves_source),
             ("default-target-schema", test_default_target_schema),
             ("target-only-column-values", test_target_only_column_values),
+            ("no-common-column-values", test_no_common_column_values),
         ]
         for index, (name, check) in enumerate(checks):
             case = root / f"case-{index}"

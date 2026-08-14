@@ -45,6 +45,11 @@ of the following requirements.
   existing rows cannot satisfy a target-only column (for example, it is NOT
   NULL and has no DEFAULT), the migration must fail and follow the post-backup
   recovery requirements below; inventing a value is not permitted.
+- This rule also applies when a table exists in both databases but has no
+  column names in common. Each existing source row must still produce one
+  target row using only the target table's DEFAULT/NULL behavior. If target
+  constraints make that impossible, the migration must fail rather than drop
+  the source rows.
 - Existing rows and tables unrelated to a schema change must remain intact.
 - A successful migration sets `PRAGMA user_version` to `37`, and
   `PRAGMA integrity_check` must return `ok`.
@@ -59,6 +64,8 @@ leading zero. Names with a different case, non-ASCII digits, a leading zero,
 or an out-of-range suffix are not legacy period columns. The columns may appear
 in any physical column order and the sequence of `N` values need not be
 contiguous. The destination `period` is that suffix interpreted as an integer.
+It must be bound directly as a SQLite INTEGER, including the maximum value;
+conversion through REAL is not permitted.
 
 The legacy table's declared primary key guarantees at most one source row for
 each `(username, bank)`. For every legacy association
@@ -156,6 +163,30 @@ one object for every association; each object has exactly the string members
 `username` and `bank` plus the finite numeric member `job_usage`. The array
 order is not significant. Repeated usage updates must not create duplicate
 period rows.
+
+The usage calculation retains the bundled Flux semantics and uses Python
+binary-float arithmetic. For each new job, `nnodes` is the larger of one and
+the number of nonempty comma-separated tokens in `ranks`; `ncores` equals
+`nnodes`, `ngpus` is zero, and `elapsed` is `actual_duration`. Read
+`node_weight`, `core_weight`, and `gpu_weight` from `config_table` as floats,
+using `1.0`, `0.0`, and `0.0` respectively when absent. Compute each job's
+weighted usage as
+
+```text
+((nnodes * node_weight) + (ncores * core_weight) +
+ (ngpus * gpu_weight)) * elapsed
+```
+
+and apply Python's built-in `round(weighted_usage, 5)` to each job separately
+before summing the jobs. This is per-job binary-float rounding (ties to even
+when the binary value is exactly halfway), not rounding once after summing.
+For jobs in the current half-life period, add that per-job sum to period zero
+and set `association_table.job_usage` to the sum of all period values. When a
+new half-life period is due, shift prior values to the next period while
+multiplying them by `decay_factor` (default `0.5`), set period zero from the
+new-job sum, and again publish the sum of the resulting periods. The JSON
+`job_usage`, the database `association_table.job_usage`, and period-zero value
+must agree with these rules.
 
 ## Preserved interfaces
 

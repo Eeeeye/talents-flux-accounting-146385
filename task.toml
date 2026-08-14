@@ -13,13 +13,17 @@ tags = ["debugging", "database", "hpc", "transactions", "offline"]
 expert_time_estimate_min = 150.0
 junior_time_estimate_min = 360.0
 difficulty_explanation = """
-The starter returns success while discarding fair-share history. A complete
-repair must reason across SQLite schema introspection, ordered composite keys,
-legacy-to-normalized data transformation, partial retries, backup consistency,
-transaction rollback, and downstream usage updates. Local changes that only
-move one function call or add a backup copy leave idempotency, schema fidelity,
-or failure restoration wrong. The verifier uses independent randomized legacy
-schemas generated from a logged replayable seed and byte-level failure-safety
+For a human database or HPC expert, the difficulty is coordinating SQLite
+schema introspection, ordered composite keys, legacy-to-normalized data
+transformation, partial retries, WAL-aware backups, rollback, and downstream
+fair-share arithmetic without weakening any one guarantee. For an agent, the
+challenge is first discovering those interacting contracts from unfamiliar
+CLI and library code, then reproducing timing- and failure-sensitive branches,
+distinguishing the intentionally broken starter from preserved behavior, and
+validating a repair across hidden schemas rather than overfitting one fixture.
+Local edits that move one call or add one copy still leave idempotency, schema
+fidelity, usage arithmetic, or restoration wrong. The verifier therefore uses
+independent schemas from a logged replayable seed plus byte-level failure
 observations.
 """
 
